@@ -1,0 +1,19 @@
+NEKSUS BACKEND QUICK START
+
+1. Upload this entire `backend` folder to your GitHub repository.
+2. In Render Web Service keep Root Directory = backend.
+3. Build Command: go mod download && go build -o neksus-api .
+4. Start Command: ./neksus-api
+5. Add Environment variables:
+   DATABASE_URL = your Render PostgreSQL INTERNAL Database URL
+   ADMIN_TOKEN = your own long random secret
+   ALLOWED_ORIGINS = *
+6. Click Manual Deploy -> Deploy latest commit.
+7. Open https://YOUR-SERVICE.onrender.com/health
+   Expected: {"ok":true,...}
+8. In NEKSUS Settings -> Backend connection:
+   REST: https://YOUR-SERVICE.onrender.com
+   WebSocket: wss://YOUR-SERVICE.onrender.com/v1/ws
+9. Add real drivers using the admin API examples in README.md.
+
+Never upload DATABASE_URL, PostgreSQL password, or ADMIN_TOKEN to GitHub.
