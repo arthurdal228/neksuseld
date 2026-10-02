@@ -7,7 +7,7 @@ This folder is the online API for the NEKSUS frontend. It uses Go + Render Postg
 Create or update a **Render Web Service** connected to the same GitHub repository.
 
 - Root Directory: `backend`
-- Build Command: `go mod download && go build -o neksus-api .`
+- Build Command: `go mod tidy && go build -o neksus-api .`
 - Start Command: `./neksus-api`
 - Health Check Path: `/health`
 - Region: use the same region as your PostgreSQL database
@@ -36,6 +36,7 @@ When the service starts for the first time, it automatically creates the require
 
 ```text
 GET  /health
+GET  /v1/admin/session   # verifies ADMIN_TOKEN
 GET  /v1/drivers
 GET  /v1/alerts?status=open
 GET  /v1/fleet/live
@@ -45,15 +46,20 @@ GET  /v1/drivers/:id/logs/:date
 GET  /v1/ws
 ```
 
+The current frontend uses `ADMIN_TOKEN` as the ELD login credential. The login screen verifies it with `GET /v1/admin/session`, keeps it only in browser `sessionStorage`, and sends it with protected REST/WebSocket data access. Closing the tab or choosing Sign out removes the session token.
+
 Admin/testing endpoints require:
 
 ```text
 Authorization: Bearer <ADMIN_TOKEN>
 ```
 
+If `API_TOKEN` is not configured, normal `/v1/*` read endpoints also require `ADMIN_TOKEN`. If you later configure `API_TOKEN`, normal read/WebSocket access uses that token while admin writes continue to require `ADMIN_TOKEN`. `/health` remains public for Render health checks.
+
 ```text
-POST /v1/admin/drivers
-PUT  /v1/admin/drivers/:id/live
+POST   /v1/admin/drivers
+DELETE /v1/admin/drivers/:id
+PUT    /v1/admin/drivers/:id/live
 PUT  /v1/admin/drivers/:id/hos
 POST /v1/admin/drivers/:id/segments
 POST /v1/admin/drivers/:id/events

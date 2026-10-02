@@ -180,7 +180,9 @@ func main() {
 	mux.Handle("GET /v1/drivers/{id}/logs/{date}", s.readAuth(http.HandlerFunc(s.handleDriverLog)))
 	mux.HandleFunc("GET /v1/ws", s.handleWS)
 
+	mux.Handle("GET /v1/admin/session", s.adminAuth(http.HandlerFunc(s.handleAdminSession)))
 	mux.Handle("POST /v1/admin/drivers", s.adminAuth(http.HandlerFunc(s.handleAdminDriver)))
+	mux.Handle("DELETE /v1/admin/drivers/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminDriverDelete)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/live", s.adminAuth(http.HandlerFunc(s.handleAdminLive)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/hos", s.adminAuth(http.HandlerFunc(s.handleAdminHOS)))
 	mux.Handle("POST /v1/admin/drivers/{id}/segments", s.adminAuth(http.HandlerFunc(s.handleAdminSegment)))
@@ -250,7 +252,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			}
 		}
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -269,8 +271,12 @@ func bearer(r *http.Request) string {
 
 func (s *Server) readAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.apiToken != "" && bearer(r) != s.apiToken {
-			writeError(w, http.StatusUnauthorized, "invalid API token")
+		expected := s.apiToken
+		if expected == "" {
+			expected = s.adminToken
+		}
+		if expected != "" && bearer(r) != expected {
+			writeError(w, http.StatusUnauthorized, "invalid access token")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -619,6 +625,14 @@ func normalizeStatus(v string) (string, bool) {
 	}
 }
 
+func (s *Server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"role":    "admin",
+		"service": "neksus-api",
+	})
+}
+
 func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ID          string  `json:"id"`
@@ -708,6 +722,24 @@ ON CONFLICT(driver_id) DO UPDATE SET duty_status=EXCLUDED.duty_status, connected
 		return
 	}
 	writeJSON(w, 201, d)
+}
+
+func (s *Server) handleAdminDriverDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "driver id is required")
+		return
+	}
+	ct, err := s.db.Exec(r.Context(), `DELETE FROM drivers WHERE id=$1`, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "driver not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleAdminLive(w http.ResponseWriter, r *http.Request) {
@@ -1046,7 +1078,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	c := &WSClient{conn: conn, authed: s.apiToken == ""}
+	expectedToken := s.apiToken
+	if expectedToken == "" {
+		expectedToken = s.adminToken
+	}
+	c := &WSClient{conn: conn, authed: expectedToken == ""}
 	s.hub.add(c)
 	defer s.hub.remove(c)
 	for {
@@ -1062,14 +1098,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		switch t {
 		case "authenticate":
 			token, _ := msg["token"].(string)
-			if s.apiToken == "" || token == s.apiToken {
+			if expectedToken == "" || token == expectedToken {
 				c.authed = true
 				c.mu.Lock()
 				_ = c.conn.WriteJSON(map[string]any{"type": "authenticated"})
 				c.mu.Unlock()
 			} else {
 				c.mu.Lock()
-				_ = c.conn.WriteJSON(map[string]any{"type": "error", "error": "invalid API token"})
+				_ = c.conn.WriteJSON(map[string]any{"type": "error", "error": "invalid access token"})
 				c.mu.Unlock()
 			}
 		case "ping":
