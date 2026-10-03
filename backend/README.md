@@ -257,3 +257,40 @@ Create carriers separately through `POST /v1/admin/companies` with `name` and `u
 ## Driver alarms
 
 `POST /v1/admin/drivers/:id/alarms` accepts `alert`, `urgent`, `chime`, `bell`, or `pulse`. Signed-in Android drivers receive pending alarms through the driver alarm service.
+
+## v8: server-backed multi-day log editing
+
+v8 replaces the browser-only administrative edit layer with PostgreSQL-backed range editing.
+
+New admin endpoints:
+
+```text
+POST /v1/admin/drivers/{id}/logs/{date}/range-edit
+POST /v1/admin/drivers/{id}/logs/{date}/undo
+```
+
+`range-edit` accepts a continuous time range plus OFF/SB/DR/ON/PC/YM, annotation, location, odometer, engine hours, trailer, shipping document, operator, and edit reason. The backend transactionally rebuilds the affected duty-segment projection so the day remains continuous, appends an immutable administrative event to `eld_events`, and stores before/after snapshots in `log_edit_batches`.
+
+Example:
+
+```json
+{
+  "start_minute": 480,
+  "end_minute": 615,
+  "status": "DR",
+  "note": "Corrected driving period",
+  "reason": "Dispatch reviewed source records",
+  "operator": "Safety Admin",
+  "location_text": "Chicago, IL",
+  "odometer_miles": 134220.5,
+  "engine_hours": 8510.4,
+  "trailer_number": "TR-12",
+  "shipping_document": "BOL-4412"
+}
+```
+
+The log GET response now also includes `edit_history`, and segment objects include the editing metadata fields. `undo` restores the previous server snapshot and marks the audit batch undone rather than deleting the audit record.
+
+After edit/undo, the backend recalculates its operational HOS projection from recent duty segments and PostgreSQL notifications drive the existing `driver.log.updated` and `driver.hos.updated` WebSocket refreshes.
+
+This HOS recalculation is an operational projection for this starter, not an independent regulatory certification engine.

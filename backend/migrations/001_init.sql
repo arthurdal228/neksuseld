@@ -224,3 +224,34 @@ BEGIN
     END LOOP;
 END;
 $$;
+
+-- v8: server-backed log editing metadata and audit history.
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS location_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS odometer_miles DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS engine_hours DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS trailer_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS shipping_document TEXT NOT NULL DEFAULT '';
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS edit_reason TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS log_edit_batches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    log_date DATE NOT NULL,
+    action TEXT NOT NULL DEFAULT 'range_edit',
+    reason TEXT NOT NULL DEFAULT '',
+    operator_name TEXT NOT NULL DEFAULT 'Admin',
+    start_minute INTEGER NOT NULL DEFAULT 0,
+    end_minute INTEGER NOT NULL DEFAULT 0,
+    before_segments JSONB NOT NULL DEFAULT '[]'::jsonb,
+    after_segments JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    undone_at TIMESTAMPTZ,
+    undone_by TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS log_edit_batches_driver_date_idx
+    ON log_edit_batches(driver_id, log_date, created_at DESC);
+
+DROP TRIGGER IF EXISTS trg_notify_log_edit_batches ON log_edit_batches;
+CREATE TRIGGER trg_notify_log_edit_batches AFTER INSERT OR UPDATE OR DELETE ON log_edit_batches
+FOR EACH ROW EXECUTE FUNCTION neksus_notify_change();

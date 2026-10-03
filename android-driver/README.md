@@ -47,3 +47,7 @@ This remains an integration MVP, not a certified ELD application. Bluetooth/ECM 
 - New drivers receive a seven-day OFF-duty history from the backend.
 - Driver log rendering treats the current open segment as ending at the current home-terminal time instead of midnight.
 - Company and USDOT are returned with the driver profile.
+
+## v8 compatibility
+
+The v8 admin site edits the same PostgreSQL duty-segment projection used by the Android driver app. No separate mobile edit database is introduced. After an admin range edit or undo, the driver's next log refresh reads the updated server segments. Original ELD/admin audit events remain available on the backend.
