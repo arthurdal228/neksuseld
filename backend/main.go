@@ -59,9 +59,19 @@ type contextKey string
 const driverIDContextKey contextKey = "driver_id"
 
 var driverUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{4,40}$`)
+var usdotPattern = regexp.MustCompile(`^[0-9]{1,8}$`)
+
+type CompanyResponse struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	USDOT       string `json:"usdot"`
+	DriverCount int    `json:"driver_count"`
+}
 
 type DriverResponse struct {
 	ID                   string  `json:"id"`
+	CompanyID            string  `json:"company_id"`
+	USDOT                string  `json:"usdot"`
 	Username             string  `json:"username"`
 	FirstName            string  `json:"first_name"`
 	LastName             string  `json:"last_name"`
@@ -157,6 +167,17 @@ type AlertResponse struct {
 	Resolution string `json:"resolution"`
 }
 
+type AlarmResponse struct {
+	ID             string  `json:"id"`
+	DriverID       string  `json:"driver_id"`
+	Title          string  `json:"title"`
+	Message        string  `json:"message"`
+	Ringtone       string  `json:"ringtone"`
+	CreatedAt      string  `json:"created_at"`
+	DeliveredAt    *string `json:"delivered_at,omitempty"`
+	AcknowledgedAt *string `json:"acknowledged_at,omitempty"`
+}
+
 func main() {
 	ctx := context.Background()
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
@@ -195,7 +216,10 @@ func main() {
 	mux.Handle("GET /v1/driver/logs/{date}", s.driverAuth(http.HandlerFunc(s.handleDriverSelfLog)))
 	mux.Handle("POST /v1/driver/status", s.driverAuth(http.HandlerFunc(s.handleDriverSelfStatus)))
 	mux.Handle("POST /v1/driver/heartbeat", s.driverAuth(http.HandlerFunc(s.handleDriverHeartbeat)))
+	mux.Handle("GET /v1/driver/alarms", s.driverAuth(http.HandlerFunc(s.handleDriverAlarms)))
+	mux.Handle("POST /v1/driver/alarms/{id}/delivered", s.driverAuth(http.HandlerFunc(s.handleDriverAlarmDelivered)))
 	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
+	mux.Handle("GET /v1/companies", s.readAuth(http.HandlerFunc(s.handleCompanies)))
 	mux.Handle("GET /v1/drivers", s.readAuth(http.HandlerFunc(s.handleDrivers)))
 	mux.Handle("GET /v1/alerts", s.readAuth(http.HandlerFunc(s.handleAlerts)))
 	mux.Handle("GET /v1/fleet/live", s.readAuth(http.HandlerFunc(s.handleFleetLive)))
@@ -205,12 +229,14 @@ func main() {
 	mux.HandleFunc("GET /v1/ws", s.handleWS)
 
 	mux.Handle("GET /v1/admin/session", s.adminAuth(http.HandlerFunc(s.handleAdminSession)))
+	mux.Handle("POST /v1/admin/companies", s.adminAuth(http.HandlerFunc(s.handleAdminCompany)))
 	mux.Handle("POST /v1/admin/drivers", s.adminAuth(http.HandlerFunc(s.handleAdminDriver)))
 	mux.Handle("DELETE /v1/admin/drivers/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminDriverDelete)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/live", s.adminAuth(http.HandlerFunc(s.handleAdminLive)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/hos", s.adminAuth(http.HandlerFunc(s.handleAdminHOS)))
 	mux.Handle("POST /v1/admin/drivers/{id}/segments", s.adminAuth(http.HandlerFunc(s.handleAdminSegment)))
 	mux.Handle("POST /v1/admin/drivers/{id}/events", s.adminAuth(http.HandlerFunc(s.handleAdminEvent)))
+	mux.Handle("POST /v1/admin/drivers/{id}/alarms", s.adminAuth(http.HandlerFunc(s.handleAdminDriverAlarm)))
 	mux.Handle("POST /v1/admin/alerts", s.adminAuth(http.HandlerFunc(s.handleAdminAlert)))
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
@@ -407,7 +433,7 @@ func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, er
 	var d DriverResponse
 	var statusSince *time.Time
 	err := s.db.QueryRow(ctx, `
-SELECT d.id, d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
        d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
@@ -416,7 +442,7 @@ FROM drivers d
 LEFT JOIN companies c ON c.id=d.company_id
 LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
 WHERE d.id=$1 AND d.active=true`, id).Scan(
-		&d.ID, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+		&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
 		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
 		&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
 		&d.Longitude, &statusSince, &d.Revision,
@@ -436,7 +462,7 @@ func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
 		limit = 1000
 	}
 	rows, err := s.db.Query(r.Context(), `
-SELECT d.id, d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
        d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
@@ -456,7 +482,7 @@ LIMIT $1`, limit)
 	for rows.Next() {
 		var d DriverResponse
 		var statusSince *time.Time
-		if err := rows.Scan(&d.ID, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+		if err := rows.Scan(&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
 			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
 			&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
 			&d.Longitude, &statusSince, &d.Revision); err != nil {
@@ -467,6 +493,67 @@ LIMIT $1`, limit)
 		out = append(out, d)
 	}
 	writeJSON(w, 200, map[string]any{"drivers": out})
+}
+
+func (s *Server) handleCompanies(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+SELECT c.id::text,c.name,c.usdot,count(d.id)::int
+FROM companies c
+LEFT JOIN drivers d ON d.company_id=c.id AND d.active=true
+GROUP BY c.id,c.name,c.usdot
+ORDER BY c.name`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []CompanyResponse{}
+	for rows.Next() {
+		var c CompanyResponse
+		if err := rows.Scan(&c.ID, &c.Name, &c.USDOT, &c.DriverCount); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		out = append(out, c)
+	}
+	writeJSON(w, 200, map[string]any{"companies": out})
+}
+
+func (s *Server) handleAdminCompany(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name  string `json:"name"`
+		USDOT string `json:"usdot"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.USDOT = strings.TrimSpace(in.USDOT)
+	if in.Name == "" || len(in.Name) > 120 {
+		writeError(w, 400, "company name is required and must be 120 characters or less")
+		return
+	}
+	if !usdotPattern.MatchString(in.USDOT) {
+		writeError(w, 400, "USDOT must contain 1-8 digits")
+		return
+	}
+	var c CompanyResponse
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO companies(name,usdot)
+VALUES($1,$2)
+ON CONFLICT(name) DO UPDATE SET usdot=EXCLUDED.usdot WHERE companies.usdot=''
+RETURNING id::text,name,usdot`, in.Name, in.USDOT).Scan(&c.ID, &c.Name, &c.USDOT)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "usdot") || strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
+			writeError(w, http.StatusConflict, "company name or USDOT already exists")
+			return
+		}
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drivers WHERE company_id=$1::uuid AND active=true`, c.ID).Scan(&c.DriverCount)
+	writeJSON(w, http.StatusCreated, c)
 }
 
 func (s *Server) queryHOS(ctx context.Context, id string) (HOSResponse, error) {
@@ -604,6 +691,86 @@ FROM alerts WHERE status=$1 ORDER BY created_at DESC LIMIT 1000`, status)
 	writeJSON(w, 200, map[string]any{"alerts": out})
 }
 
+func scanSegments(ctx context.Context, db *pgxpool.Pool, id, date string) ([]SegmentResponse, error) {
+	segs := []SegmentResponse{}
+	rows, err := db.Query(ctx, `
+SELECT id::text, start_minute, end_minute, duty_status, special_status, note, origin, edited, revision
+FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`, id, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var x SegmentResponse
+		if err := rows.Scan(&x.ID, &x.StartMinute, &x.EndMinute, &x.DutyStatus, &x.SpecialStatus,
+			&x.Note, &x.Origin, &x.Edited, &x.Revision); err != nil {
+			return nil, err
+		}
+		segs = append(segs, x)
+	}
+	return segs, rows.Err()
+}
+
+func (s *Server) repairCurrentLogIfEmpty(ctx context.Context, id, date, timezone string) error {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now := time.Now().UTC()
+	localNow := now.In(loc)
+	if localNow.Format("2006-01-02") != date {
+		return nil
+	}
+	var status, locationText string
+	var statusSince *time.Time
+	err = s.db.QueryRow(ctx, `SELECT duty_status,location_text,status_since FROM driver_live_state WHERE driver_id=$1`, id).Scan(&status, &locationText, &statusSince)
+	if errors.Is(err, pgx.ErrNoRows) {
+		status = "OFF"
+		statusSince = nil
+	} else if err != nil {
+		return err
+	}
+	if normalized, ok := normalizeStatus(status); ok {
+		status = normalized
+	} else {
+		status = "OFF"
+	}
+	startMinute := 0
+	if statusSince != nil {
+		s := statusSince.In(loc)
+		if s.Format("2006-01-02") == date {
+			startMinute = s.Hour()*60 + s.Minute()
+		}
+	}
+	if startMinute < 0 || startMinute > 1440 {
+		startMinute = 0
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM duty_segments WHERE driver_id=$1 AND log_date=$2`, id, date).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return tx.Commit(ctx)
+	}
+	if status != "OFF" && startMinute > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,0,$3,'OFF','Recovered online log continuity','System')`, id, date, startMinute); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,'Recovered current online status','System')`, id, date, startMinute, status); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,origin) VALUES($1,$2,$3,$4,'duty_status',$5,'Recovered current online status',$6,'System')`, id, date, startMinute, now, status, locationText); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	date := r.PathValue("date")
@@ -620,25 +787,22 @@ func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	segs := []SegmentResponse{}
-	rows, err := s.db.Query(r.Context(), `
-SELECT id::text, start_minute, end_minute, duty_status, special_status, note, origin, edited, revision
-FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`, id, date)
+	segs, err := scanSegments(r.Context(), s.db, id, date)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	for rows.Next() {
-		var x SegmentResponse
-		if err := rows.Scan(&x.ID, &x.StartMinute, &x.EndMinute, &x.DutyStatus, &x.SpecialStatus,
-			&x.Note, &x.Origin, &x.Edited, &x.Revision); err != nil {
-			rows.Close()
+	if len(segs) == 0 {
+		if err := s.repairCurrentLogIfEmpty(r.Context(), id, date, timezone); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
-		segs = append(segs, x)
+		segs, err = scanSegments(r.Context(), s.db, id, date)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
 	}
-	rows.Close()
 
 	events := []EventResponse{}
 	erows, err := s.db.Query(r.Context(), `
@@ -926,6 +1090,111 @@ ON CONFLICT(driver_id) DO UPDATE SET connected=true,location_text=EXCLUDED.locat
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "connected": true})
 }
 
+func ringtoneAllowed(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "alert", "urgent", "chime", "bell", "pulse":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleDriverAlarms(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text,driver_id,title,message,ringtone,created_at,delivered_at,acknowledged_at
+FROM driver_alarms
+WHERE driver_id=$1 AND delivered_at IS NULL
+ORDER BY created_at ASC LIMIT 20`, driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []AlarmResponse{}
+	for rows.Next() {
+		var a AlarmResponse
+		var created time.Time
+		var delivered, ack *time.Time
+		if err := rows.Scan(&a.ID, &a.DriverID, &a.Title, &a.Message, &a.Ringtone, &created, &delivered, &ack); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		a.CreatedAt = created.UTC().Format(time.RFC3339)
+		a.DeliveredAt = timeString(delivered)
+		a.AcknowledgedAt = timeString(ack)
+		out = append(out, a)
+	}
+	writeJSON(w, 200, map[string]any{"alarms": out})
+}
+
+func (s *Server) handleDriverAlarmDelivered(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	id := strings.TrimSpace(r.PathValue("id"))
+	ct, err := s.db.Exec(r.Context(), `UPDATE driver_alarms SET delivered_at=COALESCE(delivered_at,now()) WHERE id=$1::uuid AND driver_id=$2`, id, driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeError(w, 404, "alarm not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAdminDriverAlarm(w http.ResponseWriter, r *http.Request) {
+	driverID := strings.TrimSpace(r.PathValue("id"))
+	var in struct {
+		Title    string `json:"title"`
+		Message  string `json:"message"`
+		Ringtone string `json:"ringtone"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	in.Title = strings.TrimSpace(in.Title)
+	in.Message = strings.TrimSpace(in.Message)
+	in.Ringtone = strings.ToLower(strings.TrimSpace(in.Ringtone))
+	if in.Title == "" {
+		in.Title = "NEKSUS alert"
+	}
+	if in.Message == "" {
+		writeError(w, 400, "alarm message is required")
+		return
+	}
+	if len(in.Title) > 80 || len(in.Message) > 500 {
+		writeError(w, 400, "alarm title or message is too long")
+		return
+	}
+	if !ringtoneAllowed(in.Ringtone) {
+		writeError(w, 400, "ringtone must be alert, urgent, chime, bell or pulse")
+		return
+	}
+	var exists bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE id=$1 AND active=true)`, driverID).Scan(&exists); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if !exists {
+		writeError(w, 404, "driver not found")
+		return
+	}
+	var a AlarmResponse
+	var created time.Time
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO driver_alarms(driver_id,title,message,ringtone)
+VALUES($1,$2,$3,$4)
+RETURNING id::text,driver_id,title,message,ringtone,created_at`, driverID, in.Title, in.Message, in.Ringtone).Scan(&a.ID, &a.DriverID, &a.Title, &a.Message, &a.Ringtone, &created)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	a.CreatedAt = created.UTC().Format(time.RFC3339)
+	writeJSON(w, http.StatusCreated, a)
+}
+
 func (s *Server) handleDriverLogout(w http.ResponseWriter, r *http.Request) {
 	driverID, _ := r.Context().Value(driverIDContextKey).(string)
 	token := bearer(r)
@@ -959,6 +1228,7 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 		LicenseIssueState string `json:"license_issue_state"`
 		LicenseNumber     string `json:"license_number"`
 		Vehicle           string `json:"vehicle"`
+		CompanyID         string `json:"company_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
@@ -973,6 +1243,7 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	in.LicenseIssueState = strings.ToUpper(strings.TrimSpace(in.LicenseIssueState))
 	in.LicenseNumber = strings.TrimSpace(in.LicenseNumber)
 	in.Vehicle = strings.TrimSpace(in.Vehicle)
+	in.CompanyID = strings.TrimSpace(in.CompanyID)
 	creating := in.ID == ""
 	if !driverUsernamePattern.MatchString(in.Username) {
 		writeError(w, 400, "username must be 4-40 characters using letters, numbers, dot, underscore or dash")
@@ -980,6 +1251,10 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.FirstName == "" || in.LastName == "" {
 		writeError(w, 400, "first name and last name are required")
+		return
+	}
+	if in.CompanyID == "" {
+		writeError(w, 400, "select an existing company")
 		return
 	}
 	if len(in.LicenseIssueState) != 2 || in.LicenseNumber == "" {
@@ -1021,21 +1296,21 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 		passwordHash = string(hash)
 	}
 	fullName := strings.TrimSpace(in.FirstName + " " + in.LastName)
-	carrier := "NEKSUS ELD"
+	var companyID, carrier string
+	if err := s.db.QueryRow(r.Context(), `SELECT id::text,name FROM companies WHERE id=$1::uuid`, in.CompanyID).Scan(&companyID, &carrier); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 400, "selected company does not exist")
+		} else {
+			writeError(w, 500, err.Error())
+		}
+		return
+	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	defer tx.Rollback(r.Context())
-	var companyID string
-	if err := tx.QueryRow(r.Context(), `
-INSERT INTO companies(name) VALUES($1)
-ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name
-RETURNING id::text`, carrier).Scan(&companyID); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
 	_, err = tx.Exec(r.Context(), `
 INSERT INTO drivers(id,username,first_name,last_name,full_name,password_hash,license_issue_state,license_number,company_id,carrier,phone,email,truck_unit,active)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,true)
@@ -1064,6 +1339,39 @@ ON CONFLICT(driver_id) DO NOTHING`, in.ID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	if creating {
+		loc, _ := time.LoadLocation("America/Chicago")
+		if loc == nil {
+			loc = time.UTC
+		}
+		today := time.Now().In(loc)
+		for daysAgo := 6; daysAgo >= 0; daysAgo-- {
+			day := today.AddDate(0, 0, -daysAgo).Format("2006-01-02")
+			if daysAgo == 0 {
+				_, err = tx.Exec(r.Context(), `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin)
+SELECT $1,$2,0,NULL,'OFF','Initial seven-day OFF duty history','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day)
+			} else {
+				_, err = tx.Exec(r.Context(), `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin)
+SELECT $1,$2,0,1440,'OFF','Initial seven-day OFF duty history','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day)
+			}
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		}
+		_, err = tx.Exec(r.Context(), `
+INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,origin)
+SELECT $1,$2,0,now(),'duty_status','OFF','Initial OFF duty status','System'
+WHERE NOT EXISTS (SELECT 1 FROM eld_events WHERE driver_id=$1 AND log_date=$2 AND minute=0 AND duty_status='OFF')`, in.ID, today.Format("2006-01-02"))
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, 500, err.Error())
@@ -1528,6 +1836,10 @@ func (s *Server) handleDBNotification(ctx context.Context, p notifyPayload) {
 		s.hub.broadcast(map[string]any{"type": "driver.log.updated", "driver_id": p.DriverID})
 	case "alerts":
 		s.hub.broadcast(map[string]any{"type": "alerts.updated"})
+	case "driver_alarms":
+		s.hub.broadcast(map[string]any{"type": "driver.alarm.updated", "driver_id": p.DriverID, "alarm_id": p.ID})
+	case "companies":
+		s.hub.broadcast(map[string]any{"type": "companies.updated", "company_id": p.ID})
 	}
 }
 

@@ -3,9 +3,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS companies (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL UNIQUE,
+    usdot TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS usdot TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS companies_usdot_unique_idx ON companies(usdot) WHERE usdot <> '';
 
 CREATE TABLE IF NOT EXISTS drivers (
     id TEXT PRIMARY KEY,
@@ -142,6 +146,20 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS alerts_driver_idx ON alerts(driver_id, status);
 
+CREATE TABLE IF NOT EXISTS driver_alarms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT 'NEKSUS alert',
+    message TEXT NOT NULL DEFAULT '',
+    ringtone TEXT NOT NULL DEFAULT 'alert',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at TIMESTAMPTZ,
+    acknowledged_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS driver_alarms_pending_idx
+    ON driver_alarms(driver_id, delivered_at, created_at DESC);
+
 CREATE OR REPLACE FUNCTION neksus_touch_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -199,7 +217,7 @@ $$;
 DO $$
 DECLARE t TEXT;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['drivers','driver_live_state','driver_hos_current','duty_segments','eld_events','alerts']
+    FOREACH t IN ARRAY ARRAY['companies','drivers','driver_live_state','driver_hos_current','duty_segments','eld_events','alerts','driver_alarms']
     LOOP
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', 'trg_notify_' || t, t);
         EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION neksus_notify_change()', 'trg_notify_' || t, t);

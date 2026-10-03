@@ -40,6 +40,7 @@ POST /v1/driver/login    # username + password; returns driver session token
 GET  /v1/driver/me       # driver session token required
 POST /v1/driver/logout   # driver session token required
 GET  /v1/admin/session   # verifies ADMIN_TOKEN
+GET  /v1/companies
 GET  /v1/drivers
 GET  /v1/alerts?status=open
 GET  /v1/fleet/live
@@ -60,6 +61,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 If `API_TOKEN` is not configured, normal `/v1/*` read endpoints also require `ADMIN_TOKEN`. If you later configure `API_TOKEN`, normal read/WebSocket access uses that token while admin writes continue to require `ADMIN_TOKEN`. `/health` remains public for Render health checks.
 
 ```text
+POST   /v1/admin/companies
 POST   /v1/admin/drivers
 DELETE /v1/admin/drivers/:id
 PUT    /v1/admin/drivers/:id/live
@@ -81,9 +83,10 @@ The current NEKSUS admin frontend creates drivers through `POST /v1/admin/driver
 - Password
 - Driver license issue state
 - Driver license number
+- Existing company (selected by company ID)
 - Vehicle
 
-The backend generates the permanent internal driver ID automatically. Passwords are stored as bcrypt hashes; plaintext passwords are never stored in PostgreSQL.
+The backend generates the permanent internal driver ID automatically. A company must already exist and must have a USDOT number; the driver endpoint does not create companies. New drivers are seeded with the last seven log dates in OFF duty, with today left open until the driver changes status. Passwords are stored as bcrypt hashes; plaintext passwords are never stored in PostgreSQL.
 
 Example admin request:
 
@@ -100,6 +103,7 @@ curl -X POST "https://YOUR-API.onrender.com/v1/admin/drivers" \
     "password":"example-password",
     "license_issue_state":"IL",
     "license_number":"D1234567",
+    "company_id":"COMPANY_UUID_FROM_/v1/companies",
     "vehicle":"3101"
   }'
 ```
@@ -218,3 +222,38 @@ The matching NEKSUS Android Driver MVP uses driver-session authentication, not t
 - `POST /v1/driver/logout` - expires session and marks connection offline
 
 Deploy backend v5 before testing the Android app.
+
+## v6: log continuity + driver alarms
+
+v6 makes the current driver log use the driver's home-terminal date/timezone and repairs a missing current-day segment for older online drivers when their log is first requested.
+
+Admin alarm endpoint:
+
+```text
+POST /v1/admin/drivers/{id}/alarms
+Authorization: Bearer <ADMIN_TOKEN>
+Content-Type: application/json
+
+{
+  "title": "Safety",
+  "message": "Please call Safety when safely parked.",
+  "ringtone": "urgent"
+}
+```
+
+Supported ringtones: `alert`, `urgent`, `chime`, `bell`, `pulse`.
+
+Driver-app delivery endpoints:
+
+- `GET /v1/driver/alarms`
+- `POST /v1/driver/alarms/{id}/delivered`
+
+The Android v0.2 MVP uses a signed-in foreground connection service for near-real-time alarms. A production release should eventually use a push service such as FCM for more battery-efficient background delivery.
+
+## Companies
+
+Create carriers separately through `POST /v1/admin/companies` with `name` and `usdot`. `GET /v1/companies` returns the online company roster. The admin driver form selects one of these existing companies; it never creates a carrier from free text.
+
+## Driver alarms
+
+`POST /v1/admin/drivers/:id/alarms` accepts `alert`, `urgent`, `chime`, `bell`, or `pulse`. Signed-in Android drivers receive pending alarms through the driver alarm service.
