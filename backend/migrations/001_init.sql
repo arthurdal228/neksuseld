@@ -9,7 +9,13 @@ CREATE TABLE IF NOT EXISTS companies (
 
 CREATE TABLE IF NOT EXISTS drivers (
     id TEXT PRIMARY KEY,
+    username TEXT NOT NULL DEFAULT '',
+    first_name TEXT NOT NULL DEFAULT '',
+    last_name TEXT NOT NULL DEFAULT '',
     full_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL DEFAULT '',
+    license_issue_state TEXT NOT NULL DEFAULT '',
+    license_number TEXT NOT NULL DEFAULT '',
     company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
     carrier TEXT NOT NULL DEFAULT 'NEKSUS',
     phone TEXT NOT NULL DEFAULT '',
@@ -24,6 +30,28 @@ CREATE TABLE IF NOT EXISTS drivers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Safe upgrades for databases created by earlier NEKSUS backend versions.
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS license_issue_state TEXT NOT NULL DEFAULT '';
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS license_number TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS drivers_username_unique_idx
+    ON drivers ((lower(username))) WHERE username <> '';
+
+CREATE TABLE IF NOT EXISTS driver_sessions (
+    token_hash BYTEA PRIMARY KEY,
+    driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS driver_sessions_driver_idx ON driver_sessions(driver_id);
+CREATE INDEX IF NOT EXISTS driver_sessions_expiry_idx ON driver_sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS driver_live_state (
     driver_id TEXT PRIMARY KEY REFERENCES drivers(id) ON DELETE CASCADE,

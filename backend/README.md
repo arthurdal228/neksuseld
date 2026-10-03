@@ -36,6 +36,9 @@ When the service starts for the first time, it automatically creates the require
 
 ```text
 GET  /health
+POST /v1/driver/login    # username + password; returns driver session token
+GET  /v1/driver/me       # driver session token required
+POST /v1/driver/logout   # driver session token required
 GET  /v1/admin/session   # verifies ADMIN_TOKEN
 GET  /v1/drivers
 GET  /v1/alerts?status=open
@@ -66,27 +69,65 @@ POST /v1/admin/drivers/:id/events
 POST /v1/admin/alerts
 ```
 
-## Add your first real driver
+## Add a driver
 
-Replace the URL and token below with your own Render service and `ADMIN_TOKEN`.
+The current NEKSUS admin frontend creates drivers through `POST /v1/admin/drivers`. The form contains only:
+
+- Username
+- First name
+- Last name
+- Email
+- Phone number
+- Password
+- Driver license issue state
+- Driver license number
+- Vehicle
+
+The backend generates the permanent internal driver ID automatically. Passwords are stored as bcrypt hashes; plaintext passwords are never stored in PostgreSQL.
+
+Example admin request:
 
 ```bash
 curl -X POST "https://YOUR-API.onrender.com/v1/admin/drivers" \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "id":"DRV001",
-    "name":"REAL DRIVER NAME",
-    "carrier":"YOUR COMPANY LLC",
-    "truck":"3101",
-    "timezone":"America/Chicago",
-    "status":"OFF",
-    "connected":true,
-    "location_text":"Chicago, IL"
+    "username":"driver01",
+    "first_name":"John",
+    "last_name":"Smith",
+    "email":"driver@example.com",
+    "phone":"+1 555 0100",
+    "password":"example-password",
+    "license_issue_state":"IL",
+    "license_number":"D1234567",
+    "vehicle":"3101"
   }'
 ```
 
-The frontend will then receive this driver from `GET /v1/drivers`.
+## Android driver login foundation
+
+The backend is ready for a future Android driver app. The app should submit the driver's username and password to:
+
+```text
+POST /v1/driver/login
+```
+
+Request body:
+
+```json
+{
+  "username": "driver01",
+  "password": "example-password"
+}
+```
+
+A successful response returns an opaque driver session token and the driver's profile. The Android app should keep the token in Android secure storage and send it as:
+
+```text
+Authorization: Bearer <DRIVER_SESSION_TOKEN>
+```
+
+Use `GET /v1/driver/me` to verify the session and `POST /v1/driver/logout` to revoke it. Driver sessions expire after 30 days.
 
 ## Set the driver's HOS snapshot
 

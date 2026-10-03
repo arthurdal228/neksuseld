@@ -2,7 +2,7 @@ NEKSUS BACKEND QUICK START
 
 1. Upload this entire `backend` folder to your GitHub repository.
 2. In Render Web Service keep Root Directory = backend.
-3. Build Command: go mod download && go build -o neksus-api .
+3. Build Command: go mod tidy && go build -o neksus-api .
 4. Start Command: ./neksus-api
 5. Add Environment variables:
    DATABASE_URL = your Render PostgreSQL INTERNAL Database URL
@@ -14,6 +14,6 @@ NEKSUS BACKEND QUICK START
 8. In NEKSUS Settings -> Backend connection:
    REST: https://YOUR-SERVICE.onrender.com
    WebSocket: wss://YOUR-SERVICE.onrender.com/v1/ws
-9. Add real drivers using the admin API examples in README.md.
+9. Open NEKSUS -> Drivers -> Add driver. New driver usernames/passwords are stored online and are ready for the future Android driver login.
 
 Never upload DATABASE_URL, PostgreSQL password, or ADMIN_TOKEN to GitHub.

@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 //go:embed migrations/*.sql
@@ -48,12 +54,23 @@ type notifyPayload struct {
 	ID       string `json:"id"`
 }
 
+type contextKey string
+
+const driverIDContextKey contextKey = "driver_id"
+
+var driverUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{4,40}$`)
+
 type DriverResponse struct {
 	ID                   string  `json:"id"`
+	Username             string  `json:"username"`
+	FirstName            string  `json:"first_name"`
+	LastName             string  `json:"last_name"`
 	Name                 string  `json:"name"`
 	Carrier              string  `json:"carrier"`
 	Phone                string  `json:"phone"`
 	Email                string  `json:"email"`
+	LicenseIssueState    string  `json:"license_issue_state"`
+	LicenseNumber        string  `json:"license_number"`
 	HomeTerminalTimezone string  `json:"home_terminal_timezone"`
 	Truck                string  `json:"truck"`
 	Trailer              string  `json:"trailer"`
@@ -172,6 +189,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /v1/driver/login", s.handleDriverLogin)
+	mux.Handle("GET /v1/driver/me", s.driverAuth(http.HandlerFunc(s.handleDriverMe)))
+	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
 	mux.Handle("GET /v1/drivers", s.readAuth(http.HandlerFunc(s.handleDrivers)))
 	mux.Handle("GET /v1/alerts", s.readAuth(http.HandlerFunc(s.handleAlerts)))
 	mux.Handle("GET /v1/fleet/live", s.readAuth(http.HandlerFunc(s.handleFleetLive)))
@@ -297,6 +317,48 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) driverAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := bearer(r)
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "driver login required")
+			return
+		}
+		hash := sha256.Sum256([]byte(token))
+		var driverID string
+		err := s.db.QueryRow(r.Context(), `
+SELECT ds.driver_id
+FROM driver_sessions ds
+JOIN drivers d ON d.id=ds.driver_id
+WHERE ds.token_hash=$1 AND ds.expires_at>now() AND d.active=true`, hash[:]).Scan(&driverID)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "driver session expired or invalid")
+			return
+		}
+		_, _ = s.db.Exec(r.Context(), `UPDATE driver_sessions SET last_seen_at=now() WHERE token_hash=$1`, hash[:])
+		ctx := context.WithValue(r.Context(), driverIDContextKey, driverID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func generateDriverID() (string, error) {
+	b := make([]byte, 5)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "DRV-" + strings.ToUpper(hex.EncodeToString(b)), nil
+}
+
+func generateSessionToken() (string, []byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", nil, err
+	}
+	token := base64.RawURLEncoding.EncodeToString(b)
+	hash := sha256.Sum256([]byte(token))
+	return token, hash[:], nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -341,8 +403,8 @@ func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, er
 	var d DriverResponse
 	var statusSince *time.Time
 	err := s.db.QueryRow(ctx, `
-SELECT d.id, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
-       d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
+SELECT d.id, d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
        COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), ls.status_since, COALESCE(ls.revision,0)
@@ -350,9 +412,10 @@ FROM drivers d
 LEFT JOIN companies c ON c.id=d.company_id
 LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
 WHERE d.id=$1 AND d.active=true`, id).Scan(
-		&d.ID, &d.Name, &d.Carrier, &d.Phone, &d.Email, &d.HomeTerminalTimezone,
-		&d.Truck, &d.Trailer, &d.BOL, &d.VehicleType, &d.Certified, &d.CurrentStatus,
-		&d.Connected, &d.LocationText, &d.Latitude, &d.Longitude, &statusSince, &d.Revision,
+		&d.ID, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
+		&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
+		&d.Longitude, &statusSince, &d.Revision,
 	)
 	d.StatusSince = timeString(statusSince)
 	return d, err
@@ -369,8 +432,8 @@ func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
 		limit = 1000
 	}
 	rows, err := s.db.Query(r.Context(), `
-SELECT d.id, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
-       d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
+SELECT d.id, d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
        COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), ls.status_since, COALESCE(ls.revision,0)
@@ -389,9 +452,10 @@ LIMIT $1`, limit)
 	for rows.Next() {
 		var d DriverResponse
 		var statusSince *time.Time
-		if err := rows.Scan(&d.ID, &d.Name, &d.Carrier, &d.Phone, &d.Email, &d.HomeTerminalTimezone,
-			&d.Truck, &d.Trailer, &d.BOL, &d.VehicleType, &d.Certified, &d.CurrentStatus,
-			&d.Connected, &d.LocationText, &d.Latitude, &d.Longitude, &statusSince, &d.Revision); err != nil {
+		if err := rows.Scan(&d.ID, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
+			&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
+			&d.Longitude, &statusSince, &d.Revision); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
@@ -625,6 +689,74 @@ func normalizeStatus(v string) (string, bool) {
 	}
 }
 
+func (s *Server) handleDriverLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Username = strings.TrimSpace(in.Username)
+	if in.Username == "" || in.Password == "" {
+		writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+	var driverID, passwordHash string
+	err := s.db.QueryRow(r.Context(), `SELECT id,password_hash FROM drivers WHERE lower(username)=lower($1) AND active=true`, in.Username).Scan(&driverID, &passwordHash)
+	if err != nil || passwordHash == "" || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+		writeError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	token, tokenHash, err := generateSessionToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create session")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(30 * 24 * time.Hour)
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	_, _ = tx.Exec(r.Context(), `DELETE FROM driver_sessions WHERE expires_at<=now()`)
+	if _, err = tx.Exec(r.Context(), `INSERT INTO driver_sessions(token_hash,driver_id,expires_at) VALUES($1,$2,$3)`, tokenHash, driverID, expiresAt); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_at": expiresAt.Format(time.RFC3339), "driver": d})
+}
+
+func (s *Server) handleDriverMe(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "driver session is not valid")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"driver": d})
+}
+
+func (s *Server) handleDriverLogout(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	if token != "" {
+		hash := sha256.Sum256([]byte(token))
+		_, _ = s.db.Exec(r.Context(), `DELETE FROM driver_sessions WHERE token_hash=$1`, hash[:])
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
@@ -635,46 +767,79 @@ func (s *Server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		ID          string  `json:"id"`
-		Name        string  `json:"name"`
-		Carrier     string  `json:"carrier"`
-		Phone       string  `json:"phone"`
-		Email       string  `json:"email"`
-		Timezone    string  `json:"timezone"`
-		Truck       string  `json:"truck"`
-		Trailer     string  `json:"trailer"`
-		BOL         string  `json:"bol"`
-		VehicleType string  `json:"vehicle_type"`
-		Status      string  `json:"status"`
-		Connected   bool    `json:"connected"`
-		Location    string  `json:"location_text"`
-		Latitude    float64 `json:"latitude"`
-		Longitude   float64 `json:"longitude"`
+		ID                string `json:"id"`
+		Username          string `json:"username"`
+		FirstName         string `json:"first_name"`
+		LastName          string `json:"last_name"`
+		Email             string `json:"email"`
+		Phone             string `json:"phone"`
+		Password          string `json:"password"`
+		LicenseIssueState string `json:"license_issue_state"`
+		LicenseNumber     string `json:"license_number"`
+		Vehicle           string `json:"vehicle"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
 	in.ID = strings.TrimSpace(in.ID)
-	in.Name = strings.TrimSpace(in.Name)
-	if in.ID == "" || in.Name == "" {
-		writeError(w, 400, "id and name are required")
+	in.Username = strings.TrimSpace(in.Username)
+	in.FirstName = strings.TrimSpace(in.FirstName)
+	in.LastName = strings.TrimSpace(in.LastName)
+	in.Email = strings.TrimSpace(in.Email)
+	in.Phone = strings.TrimSpace(in.Phone)
+	in.LicenseIssueState = strings.ToUpper(strings.TrimSpace(in.LicenseIssueState))
+	in.LicenseNumber = strings.TrimSpace(in.LicenseNumber)
+	in.Vehicle = strings.TrimSpace(in.Vehicle)
+	creating := in.ID == ""
+	if !driverUsernamePattern.MatchString(in.Username) {
+		writeError(w, 400, "username must be 4-40 characters using letters, numbers, dot, underscore or dash")
 		return
 	}
-	if in.Carrier == "" {
-		in.Carrier = "NEKSUS"
+	if in.FirstName == "" || in.LastName == "" {
+		writeError(w, 400, "first name and last name are required")
+		return
 	}
-	if in.Timezone == "" {
-		in.Timezone = "America/Chicago"
+	if len(in.LicenseIssueState) != 2 || in.LicenseNumber == "" {
+		writeError(w, 400, "driver license issue state and license number are required")
+		return
 	}
-	if in.VehicleType == "" {
-		in.VehicleType = "TRACTOR"
+	if len(in.Password) > 0 && (len(in.Password) < 6 || len(in.Password) > 24) {
+		writeError(w, 400, "password must contain 6-24 characters")
+		return
 	}
-	status, ok := normalizeStatus(in.Status)
-	if !ok {
-		status = "OFF"
+	if creating && in.Password == "" {
+		writeError(w, 400, "password is required for a new driver")
+		return
 	}
-
+	if creating {
+		var err error
+		in.ID, err = generateDriverID()
+		if err != nil {
+			writeError(w, 500, "could not generate driver id")
+			return
+		}
+	}
+	var usernameTaken bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE lower(username)=lower($1) AND id<>$2)`, in.Username, in.ID).Scan(&usernameTaken); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if usernameTaken {
+		writeError(w, http.StatusConflict, "username is already in use")
+		return
+	}
+	passwordHash := ""
+	if in.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeError(w, 500, "could not secure password")
+			return
+		}
+		passwordHash = string(hash)
+	}
+	fullName := strings.TrimSpace(in.FirstName + " " + in.LastName)
+	carrier := "NEKSUS ELD"
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -685,29 +850,35 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	if err := tx.QueryRow(r.Context(), `
 INSERT INTO companies(name) VALUES($1)
 ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name
-RETURNING id::text`, in.Carrier).Scan(&companyID); err != nil {
+RETURNING id::text`, carrier).Scan(&companyID); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	_, err = tx.Exec(r.Context(), `
-INSERT INTO drivers(id,full_name,company_id,carrier,phone,email,home_terminal_timezone,truck_unit,trailer_number,shipping_document,vehicle_type,active)
-VALUES($1,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,true)
-ON CONFLICT(id) DO UPDATE SET full_name=EXCLUDED.full_name, company_id=EXCLUDED.company_id, carrier=EXCLUDED.carrier,
- phone=EXCLUDED.phone, email=EXCLUDED.email, home_terminal_timezone=EXCLUDED.home_terminal_timezone,
- truck_unit=EXCLUDED.truck_unit, trailer_number=EXCLUDED.trailer_number, shipping_document=EXCLUDED.shipping_document,
- vehicle_type=EXCLUDED.vehicle_type, active=true`, in.ID, in.Name, companyID, in.Carrier, in.Phone, in.Email,
-		in.Timezone, in.Truck, in.Trailer, in.BOL, in.VehicleType)
+INSERT INTO drivers(id,username,first_name,last_name,full_name,password_hash,license_issue_state,license_number,company_id,carrier,phone,email,truck_unit,active)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,true)
+ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
+ full_name=EXCLUDED.full_name, password_hash=CASE WHEN EXCLUDED.password_hash<>'' THEN EXCLUDED.password_hash ELSE drivers.password_hash END,
+ license_issue_state=EXCLUDED.license_issue_state, license_number=EXCLUDED.license_number,
+ company_id=EXCLUDED.company_id, carrier=EXCLUDED.carrier, phone=EXCLUDED.phone, email=EXCLUDED.email,
+ truck_unit=EXCLUDED.truck_unit, active=true`, in.ID, in.Username, in.FirstName, in.LastName, fullName, passwordHash,
+		in.LicenseIssueState, in.LicenseNumber, companyID, carrier, in.Phone, in.Email, in.Vehicle)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	_, err = tx.Exec(r.Context(), `
 INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
-VALUES($1,$2,$3,$4,$5,$6,now(),1)
-ON CONFLICT(driver_id) DO UPDATE SET duty_status=EXCLUDED.duty_status, connected=EXCLUDED.connected,
- location_text=EXCLUDED.location_text, latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
- status_since=CASE WHEN driver_live_state.duty_status<>EXCLUDED.duty_status THEN now() ELSE driver_live_state.status_since END,
- revision=driver_live_state.revision+1`, in.ID, status, in.Connected, in.Location, in.Latitude, in.Longitude)
+VALUES($1,'OFF',false,'',0,0,now(),1)
+ON CONFLICT(driver_id) DO NOTHING`, in.ID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_, err = tx.Exec(r.Context(), `
+INSERT INTO driver_hos_current(driver_id,break_remaining_seconds,drive_remaining_seconds,shift_remaining_seconds,cycle_remaining_seconds,revision)
+VALUES($1,28800,39600,50400,252000,1)
+ON CONFLICT(driver_id) DO NOTHING`, in.ID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -721,7 +892,11 @@ ON CONFLICT(driver_id) DO UPDATE SET duty_status=EXCLUDED.duty_status, connected
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, d)
+	status := http.StatusOK
+	if creating {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, d)
 }
 
 func (s *Server) handleAdminDriverDelete(w http.ResponseWriter, r *http.Request) {
