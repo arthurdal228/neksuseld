@@ -204,3 +204,17 @@ If you later set `API_TOKEN`, enter that token in the frontend's optional Bearer
 PostgreSQL changes to drivers, live state, HOS, logs, events, and alerts trigger `LISTEN/NOTIFY`. The backend converts them to WebSocket updates for NEKSUS.
 
 This starter is an operational prototype backend. It does not independently certify FMCSA compliance or calculate authoritative HOS from raw ELD telemetry.
+
+## Android driver app endpoints (v5)
+
+The matching NEKSUS Android Driver MVP uses driver-session authentication, not the admin token:
+
+- `POST /v1/driver/login` - username/password login
+- `GET /v1/driver/me` - current driver profile
+- `GET /v1/driver/hos` - current driver's HOS projection
+- `GET /v1/driver/logs/{date}` - current driver's daily segments/events
+- `POST /v1/driver/status` - driver OFF/SB/DR/ON change; updates live state and records a DriverApp segment/event
+- `POST /v1/driver/heartbeat` - marks the signed-in driver/device connected
+- `POST /v1/driver/logout` - expires session and marks connection offline
+
+Deploy backend v5 before testing the Android app.

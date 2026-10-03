@@ -191,6 +191,10 @@ func main() {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /v1/driver/login", s.handleDriverLogin)
 	mux.Handle("GET /v1/driver/me", s.driverAuth(http.HandlerFunc(s.handleDriverMe)))
+	mux.Handle("GET /v1/driver/hos", s.driverAuth(http.HandlerFunc(s.handleDriverSelfHOS)))
+	mux.Handle("GET /v1/driver/logs/{date}", s.driverAuth(http.HandlerFunc(s.handleDriverSelfLog)))
+	mux.Handle("POST /v1/driver/status", s.driverAuth(http.HandlerFunc(s.handleDriverSelfStatus)))
+	mux.Handle("POST /v1/driver/heartbeat", s.driverAuth(http.HandlerFunc(s.handleDriverHeartbeat)))
 	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
 	mux.Handle("GET /v1/drivers", s.readAuth(http.HandlerFunc(s.handleDrivers)))
 	mux.Handle("GET /v1/alerts", s.readAuth(http.HandlerFunc(s.handleAlerts)))
@@ -748,11 +752,189 @@ func (s *Server) handleDriverMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"driver": d})
 }
 
+func (s *Server) handleDriverSelfHOS(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	r.SetPathValue("id", driverID)
+	s.handleDriverHOS(w, r)
+}
+
+func (s *Server) handleDriverSelfLog(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	r.SetPathValue("id", driverID)
+	s.handleDriverLog(w, r)
+}
+
+func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	var in struct {
+		Status        string   `json:"status"`
+		LocationText  *string  `json:"location_text"`
+		Latitude      *float64 `json:"latitude"`
+		Longitude     *float64 `json:"longitude"`
+		OdometerMiles float64  `json:"odometer_miles"`
+		EngineHours   float64  `json:"engine_hours"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	status, ok := normalizeStatus(in.Status)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid duty status")
+		return
+	}
+	var timezone string
+	if err := s.db.QueryRow(r.Context(), `SELECT home_terminal_timezone FROM drivers WHERE id=$1 AND active=true`, driverID).Scan(&timezone); err != nil {
+		writeError(w, http.StatusUnauthorized, "driver is not active")
+		return
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now := time.Now().UTC()
+	localNow := now.In(loc)
+	logDate := localNow.Format("2006-01-02")
+	minute := localNow.Hour()*60 + localNow.Minute()
+
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	currentStatus := "OFF"
+	currentLocation := ""
+	currentLat, currentLon := 0.0, 0.0
+	var statusSince *time.Time
+	err = tx.QueryRow(r.Context(), `SELECT duty_status,location_text,latitude,longitude,status_since FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&currentStatus, &currentLocation, &currentLat, &currentLon, &statusSince)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if in.LocationText != nil {
+		currentLocation = strings.TrimSpace(*in.LocationText)
+	}
+	if in.Latitude != nil {
+		currentLat = *in.Latitude
+	}
+	if in.Longitude != nil {
+		currentLon = *in.Longitude
+	}
+	changed := currentStatus != status
+	_, err = tx.Exec(r.Context(), `
+INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
+VALUES($1,$2,true,$3,$4,$5,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET
+ duty_status=EXCLUDED.duty_status,
+ connected=true,
+ location_text=EXCLUDED.location_text,
+ latitude=EXCLUDED.latitude,
+ longitude=EXCLUDED.longitude,
+ status_since=CASE WHEN driver_live_state.duty_status<>EXCLUDED.duty_status THEN now() ELSE driver_live_state.status_since END,
+ revision=driver_live_state.revision+1`, driverID, status, currentLocation, currentLat, currentLon)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	var openID, openStatus string
+	var openStart int
+	err = tx.QueryRow(r.Context(), `
+SELECT id::text,duty_status,start_minute
+FROM duty_segments
+WHERE driver_id=$1 AND log_date=$2 AND end_minute IS NULL
+ORDER BY start_minute DESC, created_at DESC
+LIMIT 1 FOR UPDATE`, driverID, logDate).Scan(&openID, &openStatus, &openStart)
+	hadOpen := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(r.Context(), `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,$5,'DriverApp')`, driverID, logDate, minute, status, "Status from NEKSUS Driver")
+	} else if openStatus != status {
+		endMinute := minute
+		if endMinute < openStart {
+			endMinute = openStart
+		}
+		if _, err = tx.Exec(r.Context(), `UPDATE duty_segments SET end_minute=$2 WHERE id=$1::uuid`, openID, endMinute); err == nil {
+			_, err = tx.Exec(r.Context(), `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,$5,'DriverApp')`, driverID, logDate, minute, status, "Status from NEKSUS Driver")
+		}
+	}
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if changed || !hadOpen {
+		_, err = tx.Exec(r.Context(), `
+INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,odometer_miles,engine_hours,origin)
+VALUES($1,$2,$3,$4,'duty_status',$5,$6,$7,$8,$9,'DriverApp')`, driverID, logDate, minute, now, status, "Duty status changed in NEKSUS Driver", currentLocation, in.OdometerMiles, in.EngineHours)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "driver": d, "log_date": logDate, "minute": minute})
+}
+
+func (s *Server) handleDriverHeartbeat(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	var in struct {
+		LocationText *string  `json:"location_text"`
+		Latitude     *float64 `json:"latitude"`
+		Longitude    *float64 `json:"longitude"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in)
+	}
+	current, err := s.queryLiveState(r.Context(), driverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		current = LiveStateResponse{DriverID: driverID, Status: "OFF"}
+	} else if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if in.LocationText != nil {
+		current.LocationText = strings.TrimSpace(*in.LocationText)
+	}
+	if in.Latitude != nil {
+		current.Latitude = *in.Latitude
+	}
+	if in.Longitude != nil {
+		current.Longitude = *in.Longitude
+	}
+	_, err = s.db.Exec(r.Context(), `
+INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
+VALUES($1,$2,true,$3,$4,$5,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET connected=true,location_text=EXCLUDED.location_text,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,revision=driver_live_state.revision+1`,
+		driverID, current.Status, current.LocationText, current.Latitude, current.Longitude)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "connected": true})
+}
+
 func (s *Server) handleDriverLogout(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
 	token := bearer(r)
 	if token != "" {
 		hash := sha256.Sum256([]byte(token))
 		_, _ = s.db.Exec(r.Context(), `DELETE FROM driver_sessions WHERE token_hash=$1`, hash[:])
+	}
+	if driverID != "" {
+		_, _ = s.db.Exec(r.Context(), `UPDATE driver_live_state SET connected=false,revision=revision+1 WHERE driver_id=$1`, driverID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
