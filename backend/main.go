@@ -2018,9 +2018,8 @@ func (s *Server) handleAdminRangeEdit(w http.ResponseWriter, r *http.Request) {
 	if in.Operator == "" {
 		in.Operator = "Admin"
 	}
-	if len(in.Reason) < 3 {
-		writeError(w, 400, "edit reason must be at least 3 characters")
-		return
+	if in.Reason == "" {
+		in.Reason = "Administrative log edit"
 	}
 	duty := ""
 	special := ""
@@ -2085,15 +2084,6 @@ func (s *Server) handleAdminRangeEdit(w http.ResponseWriter, r *http.Request) {
 	if _, err := tx.Exec(r.Context(), `
 INSERT INTO log_edit_batches(driver_id,log_date,action,reason,operator_name,start_minute,end_minute,before_segments,after_segments)
 VALUES($1,$2,'range_edit',$3,$4,$5,$6,$7::jsonb,$8::jsonb)`, driverID, date, in.Reason, in.Operator, in.StartMinute, in.EndMinute, string(beforeJSON), string(afterJSON)); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `
-INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,odometer_miles,engine_hours,
- duration_seconds,origin,edited,edit_reason)
-VALUES($1,$2,$3,now(),'administrative_edit',$4,$5,$6,$7,$8,$9,'Admin',true,$10)`,
-		driverID, date, in.StartMinute, duty, in.Note, in.LocationText, in.OdometerMiles, in.EngineHours,
-		(in.EndMinute-in.StartMinute)*60, in.Reason); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
@@ -2162,12 +2152,6 @@ ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, driverID, date).Scan(&batchID, &be
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `UPDATE log_edit_batches SET undone_at=now(),undone_by=$2 WHERE id=$1::uuid`, batchID, in.Operator); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `
-INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,note,origin,edited,edit_reason,duration_seconds)
-VALUES($1,$2,$3,now(),'administrative_undo','Administrative log edit undone','Admin',true,'Undo previous edit',$4)`, driverID, date, startMinute, (endMinute-startMinute)*60); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
