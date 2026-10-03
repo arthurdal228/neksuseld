@@ -9,6 +9,8 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.location.Address;
+import android.location.Geocoder;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -23,6 +25,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
@@ -35,6 +38,9 @@ public class DriveTrackingService extends Service implements LocationListener {
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private LocationManager locationManager;
     private long lastSentAt = 0L;
+    private String lastLocationLabel = "";
+    private double lastLabelLat = 0;
+    private double lastLabelLon = 0;
 
     @Override
     public void onCreate() {
@@ -83,7 +89,8 @@ public class DriveTrackingService extends Service implements LocationListener {
     public void onLocationChanged(Location location) {
         if (location == null) return;
         long now = System.currentTimeMillis();
-        persistLocation(location);
+        String locationText = resolveLocationText(location.getLatitude(), location.getLongitude());
+        persistLocation(location, locationText);
         double mph = Math.max(0, location.getSpeed()) * 2.2369362921;
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.notify(NOTIFICATION_ID, notification(String.format(Locale.US, "GPS active · %.1f mph", mph)));
@@ -91,22 +98,49 @@ public class DriveTrackingService extends Service implements LocationListener {
         lastSentAt = now;
         String auth = token();
         if (auth.isEmpty()) return;
-        network.execute(() -> sendTelemetry(auth, location));
+        network.execute(() -> sendTelemetry(auth, location, locationText));
     }
 
-    private void persistLocation(Location l) {
+    private void persistLocation(Location l, String locationText) {
         SharedPreferences.Editor e = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit();
         e.putLong(MainActivity.PREF_LAST_LAT, Double.doubleToRawLongBits(l.getLatitude()));
         e.putLong(MainActivity.PREF_LAST_LON, Double.doubleToRawLongBits(l.getLongitude()));
         e.putLong(MainActivity.PREF_LAST_ACCURACY, Double.doubleToRawLongBits(l.hasAccuracy() ? l.getAccuracy() : 0));
         e.putLong(MainActivity.PREF_LAST_SPEED, Double.doubleToRawLongBits(l.hasSpeed() ? l.getSpeed() : 0));
         e.putLong(MainActivity.PREF_LAST_LOCATION_TIME, l.getTime() > 0 ? l.getTime() : System.currentTimeMillis());
-        e.putString(MainActivity.PREF_LAST_LOCATION_TEXT, coordinateLabel(l.getLatitude(), l.getLongitude()));
+        e.putString(MainActivity.PREF_LAST_LOCATION_TEXT, locationText);
         e.apply();
     }
 
-    private String coordinateLabel(double lat, double lon) {
-        return String.format(Locale.US, "GPS %.5f, %.5f", lat, lon);
+    private String resolveLocationText(double lat, double lon) {
+        if (!lastLocationLabel.isEmpty() && Math.abs(lat - lastLabelLat) < 0.002 && Math.abs(lon - lastLabelLon) < 0.002) {
+            return lastLocationLabel;
+        }
+        String label = "Location unavailable";
+        try {
+            if (Geocoder.isPresent()) {
+                Geocoder geocoder = new Geocoder(this, Locale.US);
+                List<Address> list = geocoder.getFromLocation(lat, lon, 1);
+                if (list != null && !list.isEmpty()) {
+                    Address a = list.get(0);
+                    String city = a.getLocality();
+                    if (city == null || city.trim().isEmpty()) city = a.getSubAdminArea();
+                    if (city == null || city.trim().isEmpty()) city = a.getFeatureName();
+                    String state = a.getAdminArea();
+                    StringBuilder b = new StringBuilder();
+                    if (city != null && !city.trim().isEmpty()) b.append(city.trim());
+                    if (state != null && !state.trim().isEmpty()) {
+                        if (b.length() > 0) b.append(", ");
+                        b.append(state.trim());
+                    }
+                    if (b.length() > 0) label = b.toString();
+                }
+            }
+        } catch (Exception ignored) {}
+        lastLocationLabel = label;
+        lastLabelLat = lat;
+        lastLabelLon = lon;
+        return label;
     }
 
     private String token() {
@@ -118,7 +152,7 @@ public class DriveTrackingService extends Service implements LocationListener {
         return Double.longBitsToDouble(p.getLong(MainActivity.PREF_ODOMETER, Double.doubleToLongBits(0)));
     }
 
-    private void sendTelemetry(String auth, Location l) {
+    private void sendTelemetry(String auth, Location l, String locationText) {
         HttpURLConnection conn = null;
         try {
             JSONObject body = new JSONObject();
@@ -127,7 +161,7 @@ public class DriveTrackingService extends Service implements LocationListener {
             body.put("accuracy_meters", l.hasAccuracy() ? l.getAccuracy() : 0);
             body.put("speed_mps", l.hasSpeed() ? Math.max(0, l.getSpeed()) : 0);
             body.put("odometer_miles", odometer());
-            body.put("location_text", coordinateLabel(l.getLatitude(), l.getLongitude()));
+            body.put("location_text", locationText);
             body.put("recorded_at", isoTime(l.getTime() > 0 ? l.getTime() : System.currentTimeMillis()));
             byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
             conn = (HttpURLConnection) new URL(API + "/v1/driver/telemetry").openConnection();

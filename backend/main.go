@@ -273,10 +273,7 @@ func main() {
 	mux.Handle("POST /v1/driver/status", s.driverAuth(http.HandlerFunc(s.handleDriverSelfStatus)))
 	mux.Handle("POST /v1/driver/heartbeat", s.driverAuth(http.HandlerFunc(s.handleDriverHeartbeat)))
 	mux.Handle("POST /v1/driver/telemetry", s.driverAuth(http.HandlerFunc(s.handleDriverTelemetry)))
-	mux.Handle("PUT /v1/driver/odometer", s.driverAuth(http.HandlerFunc(s.handleDriverOdometer)))
 	mux.Handle("GET /v1/driver/drive-state", s.driverAuth(http.HandlerFunc(s.handleDriverDriveState)))
-	mux.Handle("POST /v1/driver/drives/{id}/normalize", s.driverAuth(http.HandlerFunc(s.handleDriverNormalizeDrive)))
-	mux.Handle("POST /v1/driver/logs/{date}/swap", s.driverAuth(http.HandlerFunc(s.handleDriverSwap)))
 	mux.Handle("GET /v1/driver/alarms", s.driverAuth(http.HandlerFunc(s.handleDriverAlarms)))
 	mux.Handle("POST /v1/driver/alarms/{id}/delivered", s.driverAuth(http.HandlerFunc(s.handleDriverAlarmDelivered)))
 	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
@@ -298,6 +295,7 @@ func main() {
 	mux.Handle("POST /v1/admin/drivers/{id}/segments", s.adminAuth(http.HandlerFunc(s.handleAdminSegment)))
 	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/range-edit", s.adminAuth(http.HandlerFunc(s.handleAdminRangeEdit)))
 	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/undo", s.adminAuth(http.HandlerFunc(s.handleAdminLogUndo)))
+	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/swap", s.adminAuth(http.HandlerFunc(s.handleAdminSwap)))
 	mux.Handle("POST /v1/admin/drivers/{id}/events", s.adminAuth(http.HandlerFunc(s.handleAdminEvent)))
 	mux.Handle("POST /v1/admin/drivers/{id}/alarms", s.adminAuth(http.HandlerFunc(s.handleAdminDriverAlarm)))
 	mux.Handle("POST /v1/admin/alerts", s.adminAuth(http.HandlerFunc(s.handleAdminAlert)))
@@ -1035,7 +1033,6 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		Latitude       *float64 `json:"latitude"`
 		Longitude      *float64 `json:"longitude"`
 		AccuracyMeters float64  `json:"accuracy_meters"`
-		OdometerMiles  float64  `json:"odometer_miles"`
 		EngineHours    float64  `json:"engine_hours"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&in); err != nil {
@@ -1075,7 +1072,7 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer tx.Rollback(r.Context())
-	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, in.OdometerMiles, in.AccuracyMeters, 0, time.Now().UTC(), false)
+	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, 0, in.AccuracyMeters, 0, time.Now().UTC(), false)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
