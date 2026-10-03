@@ -294,3 +294,28 @@ The log GET response now also includes `edit_history`, and segment objects inclu
 After edit/undo, the backend recalculates its operational HOS projection from recent duty segments and PostgreSQL notifications drive the existing `driver.log.updated` and `driver.hos.updated` WebSocket refreshes.
 
 This HOS recalculation is an operational projection for this starter, not an independent regulatory certification engine.
+
+## v10 Android drive analyzer / normalizer
+
+The matching v10 Android app adds these driver-session endpoints:
+
+```text
+POST /v1/driver/telemetry
+PUT  /v1/driver/odometer
+GET  /v1/driver/drive-state
+POST /v1/driver/drives/{id}/normalize
+POST /v1/driver/logs/{date}/swap
+```
+
+Behavior:
+
+- `/v1/driver/status` rejects manual `DR`.
+- Manual `ON` requires a note.
+- Manual OFF/SB/ON changes require valid device coordinates.
+- GPS telemetry is stored in `drive_points` while an automatic drive is active.
+- The analyzer starts DR after 3 sustained samples at 5+ mph and closes it after 5 minutes at <=2 mph, using the first stationary sample as the real endpoint.
+- The normalizer compares GPS-track miles with the user-entered odometer delta. It creates hourly intermediate events only when the drive is normalized, and those intermediates use actual recorded GPS points.
+- A distance mismatch is stored as `review`; it is not silently normalized.
+- Swap transfers exact seconds across the boundary between two adjacent duty segments and preserves the combined duration.
+
+This analyzer is prototype operational logic. It is not a substitute for validated ECM/ELD vehicle-motion data in a certified production ELD.

@@ -92,6 +92,10 @@ type DriverResponse struct {
 	LocationText         string  `json:"location_text"`
 	Latitude             float64 `json:"latitude"`
 	Longitude            float64 `json:"longitude"`
+	OdometerMiles        float64 `json:"odometer_miles"`
+	GPSAccuracyMeters    float64 `json:"gps_accuracy_meters"`
+	GPSSpeedMPS          float64 `json:"gps_speed_mps"`
+	GPSRecordedAt        *string `json:"gps_recorded_at,omitempty"`
 	StatusSince          *string `json:"status_since,omitempty"`
 	Revision             int64   `json:"revision"`
 }
@@ -111,21 +115,27 @@ type HOSResponse struct {
 }
 
 type LiveStateResponse struct {
-	DriverID     string  `json:"driver_id"`
-	Status       string  `json:"status"`
-	Connected    bool    `json:"connected"`
-	LocationText string  `json:"location_text"`
-	Latitude     float64 `json:"latitude"`
-	Longitude    float64 `json:"longitude"`
-	UnitNumber   string  `json:"unit_number"`
-	StatusSince  *string `json:"status_since,omitempty"`
-	Revision     int64   `json:"revision"`
+	DriverID          string  `json:"driver_id"`
+	Status            string  `json:"status"`
+	Connected         bool    `json:"connected"`
+	LocationText      string  `json:"location_text"`
+	Latitude          float64 `json:"latitude"`
+	Longitude         float64 `json:"longitude"`
+	OdometerMiles     float64 `json:"odometer_miles"`
+	GPSAccuracyMeters float64 `json:"gps_accuracy_meters"`
+	GPSSpeedMPS       float64 `json:"gps_speed_mps"`
+	GPSRecordedAt     *string `json:"gps_recorded_at,omitempty"`
+	UnitNumber        string  `json:"unit_number"`
+	StatusSince       *string `json:"status_since,omitempty"`
+	Revision          int64   `json:"revision"`
 }
 
 type SegmentResponse struct {
 	ID               string  `json:"id"`
 	StartMinute      int     `json:"start_minute"`
+	StartSecond      int     `json:"start_second"`
 	EndMinute        *int    `json:"end_minute,omitempty"`
+	EndSecond        *int    `json:"end_second,omitempty"`
 	DutyStatus       string  `json:"duty_status"`
 	SpecialStatus    string  `json:"special_status"`
 	Note             string  `json:"note"`
@@ -153,23 +163,51 @@ type LogEditHistoryResponse struct {
 }
 
 type EventResponse struct {
-	ID              string  `json:"id"`
-	Minute          int     `json:"minute"`
-	EventTime       *string `json:"event_time,omitempty"`
-	EventType       string  `json:"event_type"`
-	DutyStatus      *string `json:"duty_status,omitempty"`
-	Note            string  `json:"note"`
-	LocationText    string  `json:"location_text"`
-	OdometerMiles   float64 `json:"odometer_miles"`
-	EngineHours     float64 `json:"engine_hours"`
-	DurationSeconds *int    `json:"duration_seconds,omitempty"`
-	Origin          string  `json:"origin"`
-	Diagnostic      bool    `json:"diagnostic"`
-	Violation       bool    `json:"violation"`
-	Edited          bool    `json:"edited"`
-	EditReason      string  `json:"edit_reason"`
-	CoDriver        string  `json:"co_driver"`
-	Revision        int64   `json:"revision"`
+	ID                string  `json:"id"`
+	Minute            int     `json:"minute"`
+	EventTime         *string `json:"event_time,omitempty"`
+	EventType         string  `json:"event_type"`
+	DutyStatus        *string `json:"duty_status,omitempty"`
+	Note              string  `json:"note"`
+	LocationText      string  `json:"location_text"`
+	Latitude          float64 `json:"latitude"`
+	Longitude         float64 `json:"longitude"`
+	GPSAccuracyMeters float64 `json:"gps_accuracy_meters"`
+	OdometerMiles     float64 `json:"odometer_miles"`
+	EngineHours       float64 `json:"engine_hours"`
+	DurationSeconds   *int    `json:"duration_seconds,omitempty"`
+	Origin            string  `json:"origin"`
+	Diagnostic        bool    `json:"diagnostic"`
+	Violation         bool    `json:"violation"`
+	Edited            bool    `json:"edited"`
+	EditReason        string  `json:"edit_reason"`
+	CoDriver          string  `json:"co_driver"`
+	Revision          int64   `json:"revision"`
+}
+
+type DriveSessionResponse struct {
+	ID                    string  `json:"id"`
+	DriverID              string  `json:"driver_id"`
+	LogDate               string  `json:"log_date"`
+	State                 string  `json:"state"`
+	StartedAt             string  `json:"started_at"`
+	EndedAt               *string `json:"ended_at,omitempty"`
+	StartSecond           int     `json:"start_second"`
+	EndSecond             *int    `json:"end_second,omitempty"`
+	StartLatitude         float64 `json:"start_latitude"`
+	StartLongitude        float64 `json:"start_longitude"`
+	EndLatitude           float64 `json:"end_latitude"`
+	EndLongitude          float64 `json:"end_longitude"`
+	StartLocationText     string  `json:"start_location_text"`
+	EndLocationText       string  `json:"end_location_text"`
+	StartOdometerMiles    float64 `json:"start_odometer_miles"`
+	EndOdometerMiles      float64 `json:"end_odometer_miles"`
+	GPSDistanceMiles      float64 `json:"gps_distance_miles"`
+	OdometerDistanceMiles float64 `json:"odometer_distance_miles"`
+	VarianceMiles         float64 `json:"variance_miles"`
+	VariancePercent       float64 `json:"variance_percent"`
+	Normalized            bool    `json:"normalized"`
+	ReviewReason          string  `json:"review_reason"`
 }
 
 type AlertResponse struct {
@@ -234,6 +272,11 @@ func main() {
 	mux.Handle("GET /v1/driver/logs/{date}", s.driverAuth(http.HandlerFunc(s.handleDriverSelfLog)))
 	mux.Handle("POST /v1/driver/status", s.driverAuth(http.HandlerFunc(s.handleDriverSelfStatus)))
 	mux.Handle("POST /v1/driver/heartbeat", s.driverAuth(http.HandlerFunc(s.handleDriverHeartbeat)))
+	mux.Handle("POST /v1/driver/telemetry", s.driverAuth(http.HandlerFunc(s.handleDriverTelemetry)))
+	mux.Handle("PUT /v1/driver/odometer", s.driverAuth(http.HandlerFunc(s.handleDriverOdometer)))
+	mux.Handle("GET /v1/driver/drive-state", s.driverAuth(http.HandlerFunc(s.handleDriverDriveState)))
+	mux.Handle("POST /v1/driver/drives/{id}/normalize", s.driverAuth(http.HandlerFunc(s.handleDriverNormalizeDrive)))
+	mux.Handle("POST /v1/driver/logs/{date}/swap", s.driverAuth(http.HandlerFunc(s.handleDriverSwap)))
 	mux.Handle("GET /v1/driver/alarms", s.driverAuth(http.HandlerFunc(s.handleDriverAlarms)))
 	mux.Handle("POST /v1/driver/alarms/{id}/delivered", s.driverAuth(http.HandlerFunc(s.handleDriverAlarmDelivered)))
 	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
@@ -451,13 +494,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, error) {
 	var d DriverResponse
-	var statusSince *time.Time
+	var statusSince, gpsRecordedAt *time.Time
 	err := s.db.QueryRow(ctx, `
 SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
        d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
-       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), ls.status_since, COALESCE(ls.revision,0)
+       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
+       COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       ls.status_since, COALESCE(ls.revision,0)
 FROM drivers d
 LEFT JOIN companies c ON c.id=d.company_id
 LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
@@ -465,9 +510,10 @@ WHERE d.id=$1 AND d.active=true`, id).Scan(
 		&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
 		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
 		&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
-		&d.Longitude, &statusSince, &d.Revision,
+		&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision,
 	)
 	d.StatusSince = timeString(statusSince)
+	d.GPSRecordedAt = timeString(gpsRecordedAt)
 	return d, err
 }
 
@@ -486,7 +532,9 @@ SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, 
        d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
-       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), ls.status_since, COALESCE(ls.revision,0)
+       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
+       COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       ls.status_since, COALESCE(ls.revision,0)
 FROM drivers d
 LEFT JOIN companies c ON c.id=d.company_id
 LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
@@ -501,15 +549,16 @@ LIMIT $1`, limit)
 	out := []DriverResponse{}
 	for rows.Next() {
 		var d DriverResponse
-		var statusSince *time.Time
+		var statusSince, gpsRecordedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
 			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
 			&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
-			&d.Longitude, &statusSince, &d.Revision); err != nil {
+			&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
 		d.StatusSince = timeString(statusSince)
+		d.GPSRecordedAt = timeString(gpsRecordedAt)
 		out = append(out, d)
 	}
 	writeJSON(w, 200, map[string]any{"drivers": out})
@@ -648,20 +697,23 @@ ORDER BY h.driver_id`)
 
 func (s *Server) queryLiveState(ctx context.Context, id string) (LiveStateResponse, error) {
 	var x LiveStateResponse
-	var since *time.Time
+	var since, gpsRecordedAt *time.Time
 	err := s.db.QueryRow(ctx, `
 SELECT ls.driver_id, ls.duty_status, ls.connected, ls.location_text, ls.latitude, ls.longitude,
+       COALESCE(ls.odometer_miles,0), COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
        d.truck_unit, ls.status_since, ls.revision
 FROM driver_live_state ls JOIN drivers d ON d.id=ls.driver_id
 WHERE ls.driver_id=$1 AND d.active=true`, id).Scan(&x.DriverID, &x.Status, &x.Connected,
-		&x.LocationText, &x.Latitude, &x.Longitude, &x.UnitNumber, &since, &x.Revision)
+		&x.LocationText, &x.Latitude, &x.Longitude, &x.OdometerMiles, &x.GPSAccuracyMeters, &x.GPSSpeedMPS, &gpsRecordedAt, &x.UnitNumber, &since, &x.Revision)
 	x.StatusSince = timeString(since)
+	x.GPSRecordedAt = timeString(gpsRecordedAt)
 	return x, err
 }
 
 func (s *Server) handleFleetLive(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(), `
 SELECT ls.driver_id, ls.duty_status, ls.connected, ls.location_text, ls.latitude, ls.longitude,
+       COALESCE(ls.odometer_miles,0), COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
        d.truck_unit, ls.status_since, ls.revision
 FROM driver_live_state ls JOIN drivers d ON d.id=ls.driver_id
 WHERE d.active=true ORDER BY d.full_name`)
@@ -673,13 +725,14 @@ WHERE d.active=true ORDER BY d.full_name`)
 	out := []LiveStateResponse{}
 	for rows.Next() {
 		var x LiveStateResponse
-		var since *time.Time
+		var since, gpsRecordedAt *time.Time
 		if err := rows.Scan(&x.DriverID, &x.Status, &x.Connected, &x.LocationText, &x.Latitude,
-			&x.Longitude, &x.UnitNumber, &since, &x.Revision); err != nil {
+			&x.Longitude, &x.OdometerMiles, &x.GPSAccuracyMeters, &x.GPSSpeedMPS, &gpsRecordedAt, &x.UnitNumber, &since, &x.Revision); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
 		x.StatusSince = timeString(since)
+		x.GPSRecordedAt = timeString(gpsRecordedAt)
 		out = append(out, x)
 	}
 	writeJSON(w, 200, map[string]any{"drivers": out})
@@ -714,7 +767,9 @@ FROM alerts WHERE status=$1 ORDER BY created_at DESC LIMIT 1000`, status)
 func scanSegments(ctx context.Context, db *pgxpool.Pool, id, date string) ([]SegmentResponse, error) {
 	segs := []SegmentResponse{}
 	rows, err := db.Query(ctx, `
-SELECT id::text, start_minute, end_minute, duty_status, special_status, note, origin, edited, revision,
+SELECT id::text, start_minute, COALESCE(start_second,start_minute*60), end_minute,
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status, note, origin, edited, revision,
        location_text, odometer_miles, engine_hours, trailer_number, shipping_document, edit_reason
 FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`, id, date)
 	if err != nil {
@@ -723,7 +778,7 @@ FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`,
 	defer rows.Close()
 	for rows.Next() {
 		var x SegmentResponse
-		if err := rows.Scan(&x.ID, &x.StartMinute, &x.EndMinute, &x.DutyStatus, &x.SpecialStatus,
+		if err := rows.Scan(&x.ID, &x.StartMinute, &x.StartSecond, &x.EndMinute, &x.EndSecond, &x.DutyStatus, &x.SpecialStatus,
 			&x.Note, &x.Origin, &x.Edited, &x.Revision, &x.LocationText, &x.OdometerMiles,
 			&x.EngineHours, &x.TrailerNumber, &x.ShippingDocument, &x.EditReason); err != nil {
 			return nil, err
@@ -828,7 +883,8 @@ func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
 
 	events := []EventResponse{}
 	erows, err := s.db.Query(r.Context(), `
-SELECT id::text, minute, event_time, event_type, duty_status, note, location_text, odometer_miles,
+SELECT id::text, minute, event_time, event_type, duty_status, note, location_text,
+       COALESCE(latitude,0), COALESCE(longitude,0), COALESCE(gps_accuracy_meters,0), odometer_miles,
        engine_hours, duration_seconds, origin, diagnostic, violation, edited, edit_reason, co_driver, revision
 FROM eld_events WHERE driver_id=$1 AND log_date=$2 ORDER BY minute,id`, id, date)
 	if err != nil {
@@ -839,7 +895,7 @@ FROM eld_events WHERE driver_id=$1 AND log_date=$2 ORDER BY minute,id`, id, date
 		var x EventResponse
 		var et *time.Time
 		if err := erows.Scan(&x.ID, &x.Minute, &et, &x.EventType, &x.DutyStatus, &x.Note,
-			&x.LocationText, &x.OdometerMiles, &x.EngineHours, &x.DurationSeconds, &x.Origin,
+			&x.LocationText, &x.Latitude, &x.Longitude, &x.GPSAccuracyMeters, &x.OdometerMiles, &x.EngineHours, &x.DurationSeconds, &x.Origin,
 			&x.Diagnostic, &x.Violation, &x.Edited, &x.EditReason, &x.CoDriver, &x.Revision); err != nil {
 			erows.Close()
 			writeError(w, 500, err.Error())
@@ -973,12 +1029,14 @@ func (s *Server) handleDriverSelfLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) {
 	driverID, _ := r.Context().Value(driverIDContextKey).(string)
 	var in struct {
-		Status        string   `json:"status"`
-		LocationText  *string  `json:"location_text"`
-		Latitude      *float64 `json:"latitude"`
-		Longitude     *float64 `json:"longitude"`
-		OdometerMiles float64  `json:"odometer_miles"`
-		EngineHours   float64  `json:"engine_hours"`
+		Status         string   `json:"status"`
+		Note           string   `json:"note"`
+		LocationText   string   `json:"location_text"`
+		Latitude       *float64 `json:"latitude"`
+		Longitude      *float64 `json:"longitude"`
+		AccuracyMeters float64  `json:"accuracy_meters"`
+		OdometerMiles  float64  `json:"odometer_miles"`
+		EngineHours    float64  `json:"engine_hours"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -989,109 +1047,50 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid duty status")
 		return
 	}
-	var timezone string
-	if err := s.db.QueryRow(r.Context(), `SELECT home_terminal_timezone FROM drivers WHERE id=$1 AND active=true`, driverID).Scan(&timezone); err != nil {
-		writeError(w, http.StatusUnauthorized, "driver is not active")
+	if status == "DR" {
+		writeError(w, http.StatusBadRequest, "Driving is automatic and cannot be selected manually")
 		return
 	}
-	loc, err := time.LoadLocation(timezone)
-	if err != nil {
-		loc = time.UTC
+	in.Note = strings.TrimSpace(in.Note)
+	if status == "ON" && in.Note == "" {
+		writeError(w, http.StatusBadRequest, "On Duty requires a note")
+		return
 	}
-	now := time.Now().UTC()
-	localNow := now.In(loc)
-	logDate := localNow.Format("2006-01-02")
-	minute := localNow.Hour()*60 + localNow.Minute()
-
+	if in.Latitude == nil || in.Longitude == nil || !validCoordinates(*in.Latitude, *in.Longitude) {
+		writeError(w, http.StatusBadRequest, "current device location is required for a status change")
+		return
+	}
+	// Do not let a manual status override an active automatic drive.
+	var activeCount int
+	if err := s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err == nil && activeCount > 0 {
+		writeError(w, http.StatusConflict, "Driving is active. Stop the vehicle before changing status manually")
+		return
+	}
+	if in.Note == "" {
+		in.Note = map[string]string{"OFF": "Off Duty", "SB": "Sleeper Berth"}[status]
+	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	defer tx.Rollback(r.Context())
-
-	currentStatus := "OFF"
-	currentLocation := ""
-	currentLat, currentLon := 0.0, 0.0
-	var statusSince *time.Time
-	err = tx.QueryRow(r.Context(), `SELECT duty_status,location_text,latitude,longitude,status_since FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&currentStatus, &currentLocation, &currentLat, &currentLon, &statusSince)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if in.LocationText != nil {
-		currentLocation = strings.TrimSpace(*in.LocationText)
-	}
-	if in.Latitude != nil {
-		currentLat = *in.Latitude
-	}
-	if in.Longitude != nil {
-		currentLon = *in.Longitude
-	}
-	changed := currentStatus != status
-	_, err = tx.Exec(r.Context(), `
-INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
-VALUES($1,$2,true,$3,$4,$5,now(),1)
-ON CONFLICT(driver_id) DO UPDATE SET
- duty_status=EXCLUDED.duty_status,
- connected=true,
- location_text=EXCLUDED.location_text,
- latitude=EXCLUDED.latitude,
- longitude=EXCLUDED.longitude,
- status_since=CASE WHEN driver_live_state.duty_status<>EXCLUDED.duty_status THEN now() ELSE driver_live_state.status_since END,
- revision=driver_live_state.revision+1`, driverID, status, currentLocation, currentLat, currentLon)
+	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, in.OdometerMiles, in.AccuracyMeters, 0, time.Now().UTC(), false)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
-	}
-
-	var openID, openStatus string
-	var openStart int
-	err = tx.QueryRow(r.Context(), `
-SELECT id::text,duty_status,start_minute
-FROM duty_segments
-WHERE driver_id=$1 AND log_date=$2 AND end_minute IS NULL
-ORDER BY start_minute DESC, created_at DESC
-LIMIT 1 FOR UPDATE`, driverID, logDate).Scan(&openID, &openStatus, &openStart)
-	hadOpen := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(r.Context(), `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,$5,'DriverApp')`, driverID, logDate, minute, status, "Status from NEKSUS Driver")
-	} else if openStatus != status {
-		endMinute := minute
-		if endMinute < openStart {
-			endMinute = openStart
-		}
-		if _, err = tx.Exec(r.Context(), `UPDATE duty_segments SET end_minute=$2 WHERE id=$1::uuid`, openID, endMinute); err == nil {
-			_, err = tx.Exec(r.Context(), `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,$5,'DriverApp')`, driverID, logDate, minute, status, "Status from NEKSUS Driver")
-		}
-	}
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if changed || !hadOpen {
-		_, err = tx.Exec(r.Context(), `
-INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,odometer_miles,engine_hours,origin)
-VALUES($1,$2,$3,$4,'duty_status',$5,$6,$7,$8,$9,'DriverApp')`, driverID, logDate, minute, now, status, "Duty status changed in NEKSUS Driver", currentLocation, in.OdometerMiles, in.EngineHours)
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
+	_ = s.recalcHOSFromSegments(r.Context(), driverID)
 	d, err := s.queryDriver(r.Context(), driverID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "driver": d, "log_date": logDate, "minute": minute})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "driver": d, "log_date": logDate, "minute": minute, "second": second})
 }
 
 func (s *Server) handleDriverHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -1598,6 +1597,7 @@ ON CONFLICT(driver_id) DO UPDATE SET break_remaining_seconds=EXCLUDED.break_rema
 
 type rangeEditInput struct {
 	StartMinute      int     `json:"start_minute"`
+	StartSecond      int     `json:"start_second"`
 	EndMinute        int     `json:"end_minute"`
 	Status           string  `json:"status"`
 	SpecialStatus    string  `json:"special_status"`
@@ -1613,18 +1613,43 @@ type rangeEditInput struct {
 
 func intPointer(v int) *int { return &v }
 
+func effectiveStartSecond(x SegmentResponse) int {
+	if x.StartSecond > 0 || x.StartMinute == 0 {
+		return x.StartSecond
+	}
+	return x.StartMinute * 60
+}
+
+func effectiveEndSecond(x SegmentResponse, end *int) *int {
+	if end == nil {
+		return nil
+	}
+	if x.EndSecond != nil {
+		v := *x.EndSecond
+		return &v
+	}
+	v := *end * 60
+	return &v
+}
+
 func copySegment(x SegmentResponse) SegmentResponse {
 	y := x
 	if x.EndMinute != nil {
 		v := *x.EndMinute
 		y.EndMinute = &v
 	}
+	if x.EndSecond != nil {
+		v := *x.EndSecond
+		y.EndSecond = &v
+	}
 	return y
 }
 
 func (s *Server) scanSegmentsTx(ctx context.Context, tx pgx.Tx, id, date string) ([]SegmentResponse, error) {
 	rows, err := tx.Query(ctx, `
-SELECT id::text, start_minute, end_minute, duty_status, special_status, note, origin, edited, revision,
+SELECT id::text, start_minute, COALESCE(start_second,start_minute*60), end_minute,
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status, note, origin, edited, revision,
        location_text, odometer_miles, engine_hours, trailer_number, shipping_document, edit_reason
 FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id FOR UPDATE`, id, date)
 	if err != nil {
@@ -1634,7 +1659,7 @@ FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id F
 	out := []SegmentResponse{}
 	for rows.Next() {
 		var x SegmentResponse
-		if err := rows.Scan(&x.ID, &x.StartMinute, &x.EndMinute, &x.DutyStatus, &x.SpecialStatus,
+		if err := rows.Scan(&x.ID, &x.StartMinute, &x.StartSecond, &x.EndMinute, &x.EndSecond, &x.DutyStatus, &x.SpecialStatus,
 			&x.Note, &x.Origin, &x.Edited, &x.Revision, &x.LocationText, &x.OdometerMiles,
 			&x.EngineHours, &x.TrailerNumber, &x.ShippingDocument, &x.EditReason); err != nil {
 			return nil, err
@@ -1699,7 +1724,7 @@ func canonicalSegments(in []SegmentResponse, dayEnd int) []SegmentResponse {
 			end = dayEnd
 		}
 		if start > cursor {
-			out = append(out, SegmentResponse{StartMinute: cursor, EndMinute: intPointer(start), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+			out = append(out, SegmentResponse{StartMinute: cursor, StartSecond: cursor * 60, EndMinute: intPointer(start), EndSecond: intPointer(start * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
 			cursor = start
 		}
 		if start < cursor {
@@ -1709,7 +1734,9 @@ func canonicalSegments(in []SegmentResponse, dayEnd int) []SegmentResponse {
 			continue
 		}
 		x.StartMinute = start
+		x.StartSecond = start * 60
 		x.EndMinute = intPointer(end)
+		x.EndSecond = intPointer(end * 60)
 		out = append(out, x)
 		cursor = end
 		if cursor >= dayEnd {
@@ -1717,10 +1744,10 @@ func canonicalSegments(in []SegmentResponse, dayEnd int) []SegmentResponse {
 		}
 	}
 	if cursor < dayEnd {
-		out = append(out, SegmentResponse{StartMinute: cursor, EndMinute: intPointer(dayEnd), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+		out = append(out, SegmentResponse{StartMinute: cursor, StartSecond: cursor * 60, EndMinute: intPointer(dayEnd), EndSecond: intPointer(dayEnd * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
 	}
 	if len(out) == 0 {
-		out = append(out, SegmentResponse{StartMinute: 0, EndMinute: intPointer(dayEnd), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+		out = append(out, SegmentResponse{StartMinute: 0, StartSecond: 0, EndMinute: intPointer(dayEnd), EndSecond: intPointer(dayEnd * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
 	}
 	return out
 }
@@ -1741,6 +1768,7 @@ func mergeAdjacentSegments(in []SegmentResponse) []SegmentResponse {
 		prev := &out[len(out)-1]
 		if prev.EndMinute != nil && *prev.EndMinute == x.StartMinute && sameEditableSegment(*prev, x) {
 			prev.EndMinute = x.EndMinute
+			prev.EndSecond = x.EndSecond
 			continue
 		}
 		out = append(out, x)
@@ -1753,7 +1781,7 @@ func applyRangeOverlay(base []SegmentResponse, in rangeEditInput, duty, special 
 	inserted := false
 	makeReplacement := func() SegmentResponse {
 		return SegmentResponse{
-			StartMinute: in.StartMinute, EndMinute: intPointer(in.EndMinute), DutyStatus: duty, SpecialStatus: special,
+			StartMinute: in.StartMinute, StartSecond: in.StartMinute * 60, EndMinute: intPointer(in.EndMinute), EndSecond: intPointer(in.EndMinute * 60), DutyStatus: duty, SpecialStatus: special,
 			Note: in.Note, Origin: "Admin", Edited: true, Revision: 1, LocationText: in.LocationText,
 			OdometerMiles: in.OdometerMiles, EngineHours: in.EngineHours, TrailerNumber: in.TrailerNumber,
 			ShippingDocument: in.ShippingDocument, EditReason: in.Reason,
@@ -1777,6 +1805,7 @@ func applyRangeOverlay(base []SegmentResponse, in rangeEditInput, duty, special 
 		if x.StartMinute < in.StartMinute {
 			prefix := copySegment(x)
 			prefix.EndMinute = intPointer(in.StartMinute)
+			prefix.EndSecond = intPointer(in.StartMinute * 60)
 			out = append(out, prefix)
 		}
 		if !inserted {
@@ -1787,6 +1816,7 @@ func applyRangeOverlay(base []SegmentResponse, in rangeEditInput, duty, special 
 			suffix := copySegment(x)
 			suffix.ID = ""
 			suffix.StartMinute = in.EndMinute
+			suffix.StartSecond = in.EndMinute * 60
 			suffix.EndMinute = intPointer(end)
 			out = append(out, suffix)
 		}
@@ -1811,20 +1841,20 @@ func (s *Server) replaceDaySegmentsTx(ctx context.Context, tx pgx.Tx, driverID, 
 		}
 		if x.ID != "" {
 			_, err := tx.Exec(ctx, `
-INSERT INTO duty_segments(id,driver_id,log_date,start_minute,end_minute,duty_status,special_status,note,origin,edited,revision,
+INSERT INTO duty_segments(id,driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,special_status,note,origin,edited,revision,
  location_text,odometer_miles,engine_hours,trailer_number,shipping_document,edit_reason)
-VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,GREATEST($11,1),$12,$13,$14,$15,$16,$17)`,
-				x.ID, driverID, date, x.StartMinute, end, x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
+VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,GREATEST($13,1),$14,$15,$16,$17,$18,$19)`,
+				x.ID, driverID, date, x.StartMinute, effectiveStartSecond(x), end, effectiveEndSecond(x, end), x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
 				x.Revision, x.LocationText, x.OdometerMiles, x.EngineHours, x.TrailerNumber, x.ShippingDocument, x.EditReason)
 			if err != nil {
 				return err
 			}
 		} else {
 			_, err := tx.Exec(ctx, `
-INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,special_status,note,origin,edited,revision,
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,special_status,note,origin,edited,revision,
  location_text,odometer_miles,engine_hours,trailer_number,shipping_document,edit_reason)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,GREATEST($10,1),$11,$12,$13,$14,$15,$16)`,
-				driverID, date, x.StartMinute, end, x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,GREATEST($12,1),$13,$14,$15,$16,$17,$18)`,
+				driverID, date, x.StartMinute, effectiveStartSecond(x), end, effectiveEndSecond(x, end), x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
 				x.Revision, x.LocationText, x.OdometerMiles, x.EngineHours, x.TrailerNumber, x.ShippingDocument, x.EditReason)
 			if err != nil {
 				return err

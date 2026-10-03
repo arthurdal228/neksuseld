@@ -255,3 +255,87 @@ CREATE INDEX IF NOT EXISTS log_edit_batches_driver_date_idx
 DROP TRIGGER IF EXISTS trg_notify_log_edit_batches ON log_edit_batches;
 CREATE TRIGGER trg_notify_log_edit_batches AFTER INSERT OR UPDATE OR DELETE ON log_edit_batches
 FOR EACH ROW EXECUTE FUNCTION neksus_notify_change();
+
+-- v10: mobile GPS drive analyzer / normalizer and second-precision swap support.
+ALTER TABLE driver_live_state ADD COLUMN IF NOT EXISTS odometer_miles DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_live_state ADD COLUMN IF NOT EXISTS gps_accuracy_meters DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_live_state ADD COLUMN IF NOT EXISTS gps_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_live_state ADD COLUMN IF NOT EXISTS gps_recorded_at TIMESTAMPTZ;
+
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS start_second INTEGER;
+ALTER TABLE duty_segments ADD COLUMN IF NOT EXISTS end_second INTEGER;
+UPDATE duty_segments SET start_second = start_minute * 60 WHERE start_second IS NULL;
+UPDATE duty_segments SET end_second = end_minute * 60 WHERE end_second IS NULL AND end_minute IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS drive_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    log_date DATE NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','pending','normalized','review')),
+    started_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ,
+    start_second INTEGER NOT NULL DEFAULT 0,
+    end_second INTEGER,
+    start_latitude DOUBLE PRECISION NOT NULL DEFAULT 0,
+    start_longitude DOUBLE PRECISION NOT NULL DEFAULT 0,
+    end_latitude DOUBLE PRECISION NOT NULL DEFAULT 0,
+    end_longitude DOUBLE PRECISION NOT NULL DEFAULT 0,
+    start_location_text TEXT NOT NULL DEFAULT '',
+    end_location_text TEXT NOT NULL DEFAULT '',
+    start_odometer_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    end_odometer_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    gps_distance_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    odometer_distance_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    variance_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    variance_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+    normalized BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS drive_sessions_driver_idx ON drive_sessions(driver_id, started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS drive_sessions_one_active_idx ON drive_sessions(driver_id) WHERE state='active';
+
+CREATE TABLE IF NOT EXISTS drive_points (
+    id BIGSERIAL PRIMARY KEY,
+    session_id UUID NOT NULL REFERENCES drive_sessions(id) ON DELETE CASCADE,
+    driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    accuracy_meters DOUBLE PRECISION NOT NULL DEFAULT 0,
+    speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
+    odometer_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
+    location_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS drive_points_session_time_idx ON drive_points(session_id, recorded_at);
+
+CREATE TABLE IF NOT EXISTS driver_motion_state (
+    driver_id TEXT PRIMARY KEY REFERENCES drivers(id) ON DELETE CASCADE,
+    moving_samples INTEGER NOT NULL DEFAULT 0,
+    stopped_since TIMESTAMPTZ,
+    active_drive_id UUID REFERENCES drive_sessions(id) ON DELETE SET NULL,
+    last_sample_at TIMESTAMPTZ,
+    last_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+DROP TRIGGER IF EXISTS trg_drive_sessions_touch ON drive_sessions;
+CREATE TRIGGER trg_drive_sessions_touch BEFORE UPDATE ON drive_sessions
+FOR EACH ROW EXECUTE FUNCTION neksus_touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_notify_drive_sessions ON drive_sessions;
+CREATE TRIGGER trg_notify_drive_sessions AFTER INSERT OR UPDATE OR DELETE ON drive_sessions
+FOR EACH ROW EXECUTE FUNCTION neksus_notify_change();
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_started_at TIMESTAMPTZ;
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_start_latitude DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_start_longitude DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_start_accuracy DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_start_odometer DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE driver_motion_state ADD COLUMN IF NOT EXISTS moving_start_location_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS drive_session_id UUID REFERENCES drive_sessions(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS eld_events_drive_session_idx ON eld_events(drive_session_id);
+
+ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS gps_accuracy_meters DOUBLE PRECISION NOT NULL DEFAULT 0;
