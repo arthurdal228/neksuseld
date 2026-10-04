@@ -290,6 +290,7 @@ func main() {
 	mux.Handle("POST /v1/admin/companies", s.adminAuth(http.HandlerFunc(s.handleAdminCompany)))
 	mux.Handle("POST /v1/admin/drivers", s.adminAuth(http.HandlerFunc(s.handleAdminDriver)))
 	mux.Handle("DELETE /v1/admin/drivers/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminDriverDelete)))
+	mux.Handle("PUT /v1/admin/drivers/{id}/trip-info", s.adminAuth(http.HandlerFunc(s.handleAdminTripInfo)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/live", s.adminAuth(http.HandlerFunc(s.handleAdminLive)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/hos", s.adminAuth(http.HandlerFunc(s.handleAdminHOS)))
 	mux.Handle("POST /v1/admin/drivers/{id}/segments", s.adminAuth(http.HandlerFunc(s.handleAdminSegment)))
@@ -1427,6 +1428,43 @@ WHERE NOT EXISTS (SELECT 1 FROM eld_events WHERE driver_id=$1 AND log_date=$2 AN
 	writeJSON(w, status, d)
 }
 
+func (s *Server) handleAdminTripInfo(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "driver id is required")
+		return
+	}
+	var in struct {
+		Trailer          string `json:"trailer"`
+		ShippingDocument string `json:"shipping_document"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Trailer = strings.TrimSpace(in.Trailer)
+	in.ShippingDocument = strings.TrimSpace(in.ShippingDocument)
+	if len(in.Trailer) > 40 || len(in.ShippingDocument) > 80 {
+		writeError(w, http.StatusBadRequest, "trip information is too long")
+		return
+	}
+	cmd, err := s.db.Exec(r.Context(), `UPDATE drivers SET trailer_number=$2, shipping_document=$3, updated_at=now() WHERE id=$1 AND active=true`, id, in.Trailer, in.ShippingDocument)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if cmd.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "driver not found")
+		return
+	}
+	d, err := s.queryDriver(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
 func (s *Server) handleAdminDriverDelete(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
@@ -1763,9 +1801,29 @@ func mergeAdjacentSegments(in []SegmentResponse) []SegmentResponse {
 			continue
 		}
 		prev := &out[len(out)-1]
-		if prev.EndMinute != nil && *prev.EndMinute == x.StartMinute && sameEditableSegment(*prev, x) {
+		prevEnd := effectiveEndSecond(*prev, prev.EndMinute)
+		contiguous := prevEnd != nil && *prevEnd == effectiveStartSecond(x)
+		sameDuty := prev.DutyStatus == x.DutyStatus && prev.SpecialStatus == x.SpecialStatus
+		adminMerge := sameDuty && (prev.Edited || x.Edited || prev.Origin == "Admin" || x.Origin == "Admin")
+		if contiguous && (sameEditableSegment(*prev, x) || adminMerge) {
 			prev.EndMinute = x.EndMinute
 			prev.EndSecond = x.EndSecond
+			prev.Edited = prev.Edited || x.Edited
+			if prev.Origin == "" || x.Origin == "Admin" {
+				prev.Origin = x.Origin
+			}
+			if prev.Note == "" {
+				prev.Note = x.Note
+			}
+			if prev.LocationText == "" {
+				prev.LocationText = x.LocationText
+			}
+			if prev.TrailerNumber == "" {
+				prev.TrailerNumber = x.TrailerNumber
+			}
+			if prev.ShippingDocument == "" {
+				prev.ShippingDocument = x.ShippingDocument
+			}
 			continue
 		}
 		out = append(out, x)
