@@ -559,6 +559,10 @@ func (s *Server) handleAdminSwap(w http.ResponseWriter, r *http.Request) {
 	driverID := r.PathValue("id")
 	date := r.PathValue("date")
 	var in struct {
+		FirstSegmentID     string `json:"first_segment_id"`
+		SecondSegmentID    string `json:"second_segment_id"`
+		FirstResultSeconds int    `json:"first_result_seconds"`
+		// Legacy v12 fields are kept for a short compatibility window.
 		SegmentAID      string `json:"segment_a_id"`
 		SegmentBID      string `json:"segment_b_id"`
 		FromSegmentID   string `json:"from_segment_id"`
@@ -566,10 +570,6 @@ func (s *Server) handleAdminSwap(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON")
-		return
-	}
-	if in.TransferSeconds <= 0 {
-		writeError(w, 400, "transfer_seconds must be positive")
 		return
 	}
 	tx, err := s.db.Begin(r.Context())
@@ -583,74 +583,134 @@ func (s *Server) handleAdminSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	ia, ib := -1, -1
+
+	firstID, secondID := strings.TrimSpace(in.FirstSegmentID), strings.TrimSpace(in.SecondSegmentID)
+	if firstID == "" || secondID == "" {
+		// Translate the old v12 transfer request into the new "first result" model.
+		firstID, secondID = strings.TrimSpace(in.SegmentAID), strings.TrimSpace(in.SegmentBID)
+	}
+	firstIndex, secondIndex := -1, -1
 	for i, x := range segs {
-		if x.ID == in.SegmentAID {
-			ia = i
+		if x.ID == firstID {
+			firstIndex = i
 		}
-		if x.ID == in.SegmentBID {
-			ib = i
+		if x.ID == secondID {
+			secondIndex = i
 		}
 	}
-	if ia < 0 || ib < 0 {
+	if firstIndex < 0 || secondIndex < 0 {
 		writeError(w, 404, "selected status was not found")
 		return
 	}
-	if ia > ib {
-		ia, ib = ib, ia
-	}
-	if ib != ia+1 {
-		writeError(w, 400, "swap currently requires two adjacent statuses")
+	if firstIndex == secondIndex || int(math.Abs(float64(firstIndex-secondIndex))) != 1 {
+		writeError(w, 400, "swap requires two touching statuses")
 		return
 	}
-	a, b := segs[ia], segs[ib]
-	dayEndSecond := 86400
+
+	first := segs[firstIndex]
+	second := segs[secondIndex]
+	firstStart, firstEnd := effectiveStartSecond(first), 86400
+	if first.EndSecond != nil {
+		firstEnd = *first.EndSecond
+	} else if first.EndMinute != nil {
+		firstEnd = *first.EndMinute * 60
+	}
+	secondStart, secondEnd := effectiveStartSecond(second), 86400
+	if second.EndSecond != nil {
+		secondEnd = *second.EndSecond
+	} else if second.EndMinute != nil {
+		secondEnd = *second.EndMinute * 60
+	}
 	if date == driverCurrentDateServer(r.Context(), tx, driverID) {
 		if _, _, nowSecond, _, e := localDriverMoment(r.Context(), tx, driverID, time.Now().UTC()); e == nil {
-			dayEndSecond = nowSecond
+			if first.EndSecond == nil && first.EndMinute == nil {
+				firstEnd = nowSecond
+			}
+			if second.EndSecond == nil && second.EndMinute == nil {
+				secondEnd = nowSecond
+			}
 		}
 	}
-	aStart, aEnd := effectiveStartSecond(a), dayEndSecond
-	if a.EndSecond != nil {
-		aEnd = *a.EndSecond
-	} else if a.EndMinute != nil {
-		aEnd = *a.EndMinute * 60
+	firstDuration := firstEnd - firstStart
+	secondDuration := secondEnd - secondStart
+	if firstDuration <= 0 || secondDuration <= 0 {
+		writeError(w, 400, "selected status duration is invalid")
+		return
 	}
-	bStart, bEnd := effectiveStartSecond(b), dayEndSecond
-	if b.EndSecond != nil {
-		bEnd = *b.EndSecond
-	} else if b.EndMinute != nil {
-		bEnd = *b.EndMinute * 60
+	totalDuration := firstDuration + secondDuration
+	desiredFirst := in.FirstResultSeconds
+
+	if desiredFirst <= 0 && in.TransferSeconds > 0 {
+		// Legacy behavior compatibility. The frontend no longer sends this form.
+		desiredFirst = firstDuration
+		if in.FromSegmentID == first.ID {
+			desiredFirst -= in.TransferSeconds
+		} else if in.FromSegmentID == second.ID {
+			desiredFirst += in.TransferSeconds
+		}
 	}
-	if math.Abs(float64(aEnd-bStart)) > 1 {
+	if desiredFirst <= 0 || desiredFirst >= totalDuration {
+		writeError(w, 400, "result would remove an entire status")
+		return
+	}
+	if desiredFirst == firstDuration {
+		writeError(w, 400, "first selected status duration did not change")
+		return
+	}
+
+	leftIndex, rightIndex := firstIndex, secondIndex
+	if leftIndex > rightIndex {
+		leftIndex, rightIndex = rightIndex, leftIndex
+	}
+	left, right := segs[leftIndex], segs[rightIndex]
+	leftStart := effectiveStartSecond(left)
+	rightEnd := 86400
+	if right.EndSecond != nil {
+		rightEnd = *right.EndSecond
+	} else if right.EndMinute != nil {
+		rightEnd = *right.EndMinute * 60
+	} else if date == driverCurrentDateServer(r.Context(), tx, driverID) {
+		if _, _, nowSecond, _, e := localDriverMoment(r.Context(), tx, driverID, time.Now().UTC()); e == nil {
+			rightEnd = nowSecond
+		}
+	}
+	leftEnd := rightEnd
+	if left.EndSecond != nil {
+		leftEnd = *left.EndSecond
+	} else if left.EndMinute != nil {
+		leftEnd = *left.EndMinute * 60
+	}
+	rightStart := effectiveStartSecond(right)
+	if math.Abs(float64(leftEnd-rightStart)) > 1 {
 		writeError(w, 400, "selected statuses are not contiguous")
 		return
 	}
-	boundary := bStart
-	if in.FromSegmentID == a.ID {
-		boundary -= in.TransferSeconds
-	} else if in.FromSegmentID == b.ID {
-		boundary += in.TransferSeconds
+
+	var boundary int
+	if firstIndex == leftIndex {
+		// First selected is the left status. Its result runs forward from its fixed start.
+		boundary = leftStart + desiredFirst
 	} else {
-		writeError(w, 400, "from_segment_id must match one selected status")
+		// First selected is the right status. Its result runs backward from its fixed end.
+		boundary = rightEnd - desiredFirst
+	}
+	if boundary <= leftStart || boundary >= rightEnd {
+		writeError(w, 400, "result would remove an entire status")
 		return
 	}
-	if boundary <= aStart || boundary >= bEnd {
-		writeError(w, 400, "transfer would remove an entire status")
-		return
-	}
+
 	beforeJSON, _ := json.Marshal(segs)
-	a.EndSecond = intPointer(boundary)
-	a.EndMinute = intPointer(boundary / 60)
-	b.StartSecond = boundary
-	b.StartMinute = boundary / 60
-	segs[ia], segs[ib] = a, b
+	left.EndSecond = intPointer(boundary)
+	left.EndMinute = intPointer(boundary / 60)
+	right.StartSecond = boundary
+	right.StartMinute = boundary / 60
+	segs[leftIndex], segs[rightIndex] = left, right
 	afterJSON, _ := json.Marshal(segs)
 	if err = s.replaceDaySegmentsTx(r.Context(), tx, driverID, date, segs, date == driverCurrentDateServer(r.Context(), tx, driverID)); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	_, err = tx.Exec(r.Context(), `INSERT INTO log_edit_batches(driver_id,log_date,action,reason,operator_name,start_minute,end_minute,before_segments,after_segments) VALUES($1,$2,'swap','Admin swap','Admin',$3,$4,$5::jsonb,$6::jsonb)`, driverID, date, a.StartMinute, bEnd/60, string(beforeJSON), string(afterJSON))
+	_, err = tx.Exec(r.Context(), `INSERT INTO log_edit_batches(driver_id,log_date,action,reason,operator_name,start_minute,end_minute,before_segments,after_segments) VALUES($1,$2,'swap','Admin swap','Admin',$3,$4,$5::jsonb,$6::jsonb)`, driverID, date, left.StartMinute, rightEnd/60, string(beforeJSON), string(afterJSON))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -660,7 +720,16 @@ func (s *Server) handleAdminSwap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.recalcHOSFromSegments(r.Context(), driverID)
-	writeJSON(w, 200, map[string]any{"ok": true, "boundary_second": boundary, "boundary_minute": boundary / 60})
+	writeJSON(w, 200, map[string]any{
+		"ok":                    true,
+		"first_segment_id":      first.ID,
+		"second_segment_id":     second.ID,
+		"first_before_seconds":  firstDuration,
+		"first_after_seconds":   desiredFirst,
+		"second_before_seconds": secondDuration,
+		"second_after_seconds":  totalDuration - desiredFirst,
+		"boundary_second":       boundary,
+	})
 }
 
 func driverCurrentDateServer(ctx context.Context, q interface {
