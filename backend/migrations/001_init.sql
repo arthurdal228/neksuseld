@@ -343,3 +343,52 @@ ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS gps_accuracy_meters DOUBLE PRECI
 -- v13: remove legacy synthetic seed-note labels. The OFF history remains intact.
 UPDATE duty_segments SET note='' WHERE note='Initial seven-day OFF duty history';
 UPDATE eld_events SET note='' WHERE note='Initial OFF duty status';
+
+-- v14: NEKSUS Control / operator web accounts.
+CREATE TABLE IF NOT EXISTS web_users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username TEXT NOT NULL,
+    full_name TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'operator' CHECK (role IN ('super_admin','manager','operator','viewer')),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    all_companies BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS web_users_username_unique_idx ON web_users ((lower(username)));
+
+CREATE TABLE IF NOT EXISTS web_user_companies (
+    user_id UUID NOT NULL REFERENCES web_users(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(user_id,company_id)
+);
+CREATE INDEX IF NOT EXISTS web_user_companies_company_idx ON web_user_companies(company_id);
+
+CREATE TABLE IF NOT EXISTS web_sessions (
+    token_hash BYTEA PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES web_users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON web_sessions(user_id);
+CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON web_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS web_activity (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID REFERENCES web_users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
+    driver_id TEXT REFERENCES drivers(id) ON DELETE SET NULL,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS web_activity_created_idx ON web_activity(created_at DESC);
+CREATE INDEX IF NOT EXISTS web_activity_user_idx ON web_activity(user_id,created_at DESC);
+
+DROP TRIGGER IF EXISTS trg_web_users_touch ON web_users;
+CREATE TRIGGER trg_web_users_touch BEFORE UPDATE ON web_users
+FOR EACH ROW EXECUTE FUNCTION neksus_touch_updated_at();

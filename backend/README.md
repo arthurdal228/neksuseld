@@ -324,3 +324,19 @@ This analyzer is prototype operational logic. It is not a substitute for validat
 `GET /v1/driver/logs/{date}` and the admin log endpoint now enrich daily `duty_segments` with `episode_start_date`, `episode_start_second`, `episode_end_date`, `episode_end_second`, `episode_duration_seconds`, and `episode_open`. Adjacent same-status fragments that touch across midnight are treated as one display episode while the stored per-day fragments remain intact for daily logs and edits.
 
 New-driver seeding now starts exactly 168 hours before creation and no longer adds the user-visible "Initial seven-day OFF duty history" note. The migration clears that legacy note from existing seeded rows.
+
+## v14 NEKSUS Control and web user authentication
+
+Normal NEKSUS web users now authenticate with username/password through `/v1/web/login`; they no longer need the Render `ADMIN_TOKEN`.
+
+Render bootstrap variables:
+
+```text
+CONTROL_ADMIN_USERNAME=neksusadmin
+CONTROL_ADMIN_PASSWORD=use-a-strong-password
+CONTROL_ADMIN_NAME=NEKSUS Super Admin
+```
+
+On startup, the backend creates/refreshes that account as `super_admin` with access to all companies. Use the separate `control/` frontend to create operator/manager/viewer accounts and assign companies.
+
+Company scoping is enforced in the backend for company/driver lists, bulk HOS, live fleet data, alerts, driver-specific log/HOS routes, and driver-specific admin write routes. The original `ADMIN_TOKEN` remains available only as a maintenance/backward-compatibility path during migration.

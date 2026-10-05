@@ -42,9 +42,10 @@ type Hub struct {
 }
 
 type WSClient struct {
-	conn   *websocket.Conn
-	mu     sync.Mutex
-	authed bool
+	conn     *websocket.Conn
+	mu       sync.Mutex
+	authed   bool
+	identity *WebIdentity
 }
 
 type notifyPayload struct {
@@ -267,11 +268,25 @@ func main() {
 		apiToken:       strings.TrimSpace(os.Getenv("API_TOKEN")),
 		allowedOrigins: parseOrigins(os.Getenv("ALLOWED_ORIGINS")),
 	}
+	if err := s.bootstrapControlAdmin(ctx); err != nil {
+		log.Fatalf("control admin bootstrap: %v", err)
+	}
 
 	go s.listenForChanges(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /v1/web/login", s.webLogin)
+	mux.Handle("POST /v1/web/logout", s.webSessionAuth(http.HandlerFunc(s.webLogout)))
+	mux.Handle("GET /v1/web/me", s.webSessionAuth(http.HandlerFunc(s.webMe)))
+	mux.HandleFunc("POST /v1/control/login", s.webLogin)
+	mux.Handle("POST /v1/control/logout", s.webSessionAuth(http.HandlerFunc(s.webLogout)))
+	mux.Handle("GET /v1/control/me", s.webSessionAuth(http.HandlerFunc(s.webMe)))
+	mux.Handle("GET /v1/control/users", s.controlAdminAuth(http.HandlerFunc(s.handleControlUsers)))
+	mux.Handle("POST /v1/control/users", s.controlAdminAuth(http.HandlerFunc(s.handleControlUserCreate)))
+	mux.Handle("PATCH /v1/control/users/{id}", s.controlAdminAuth(http.HandlerFunc(s.handleControlUserUpdate)))
+	mux.Handle("GET /v1/control/companies", s.controlAdminAuth(http.HandlerFunc(s.handleControlCompanies)))
+	mux.Handle("GET /v1/control/activity", s.controlAdminAuth(http.HandlerFunc(s.handleControlActivity)))
 	mux.HandleFunc("POST /v1/driver/login", s.handleDriverLogin)
 	mux.Handle("GET /v1/driver/me", s.driverAuth(http.HandlerFunc(s.handleDriverMe)))
 	mux.Handle("GET /v1/driver/hos", s.driverAuth(http.HandlerFunc(s.handleDriverSelfHOS)))
@@ -389,29 +404,45 @@ func bearer(r *http.Request) string {
 
 func (s *Server) readAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		expected := s.apiToken
-		if expected == "" {
-			expected = s.adminToken
-		}
-		if expected != "" && bearer(r) != expected {
-			writeError(w, http.StatusUnauthorized, "invalid access token")
+		i, err := s.authWebToken(r, false)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "login required")
 			return
 		}
-		next.ServeHTTP(w, r)
+		if id := strings.TrimSpace(r.PathValue("id")); id != "" && strings.Contains(r.URL.Path, "/drivers/") && !s.ensureDriverAllowed(r.Context(), i, id) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+		ctx := context.WithValue(r.Context(), webIdentityContextKey, i)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.adminToken == "" {
-			writeError(w, http.StatusServiceUnavailable, "ADMIN_TOKEN is not configured")
+		i, err := s.authWebToken(r, true)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "operator login required")
 			return
 		}
-		if bearer(r) != s.adminToken {
-			writeError(w, http.StatusUnauthorized, "invalid admin token")
-			return
+		driverID := ""
+		if id := strings.TrimSpace(r.PathValue("id")); id != "" && strings.Contains(r.URL.Path, "/drivers/") {
+			driverID = id
+			if !s.ensureDriverAllowed(r.Context(), i, id) {
+				writeError(w, http.StatusForbidden, "driver is outside your company access")
+				return
+			}
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), webIdentityContextKey, i)
+		cw := &statusCaptureWriter{ResponseWriter: w}
+		next.ServeHTTP(cw, r.WithContext(ctx))
+		if !i.Legacy && cw.status < 400 {
+			companyID := ""
+			if driverID != "" {
+				companyID, _ = s.driverCompanyID(r.Context(), driverID)
+			}
+			s.logWebActivity(r.Context(), i, r.Method+" "+r.URL.Path, companyID, driverID, map[string]any{"status": cw.status})
+		}
 	})
 }
 
@@ -564,6 +595,9 @@ LIMIT $1`, limit)
 		}
 		d.StatusSince = timeString(statusSince)
 		d.GPSRecordedAt = timeString(gpsRecordedAt)
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(d.CompanyID) {
+			continue
+		}
 		out = append(out, d)
 	}
 	writeJSON(w, 200, map[string]any{"drivers": out})
@@ -588,12 +622,19 @@ ORDER BY c.name`)
 			writeError(w, 500, err.Error())
 			return
 		}
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(c.ID) {
+			continue
+		}
 		out = append(out, c)
 	}
 	writeJSON(w, 200, map[string]any{"companies": out})
 }
 
 func (s *Server) handleAdminCompany(w http.ResponseWriter, r *http.Request) {
+	if i := identityFromContext(r.Context()); i != nil && !i.canManageCompanies() {
+		writeError(w, http.StatusForbidden, "manager access required")
+		return
+	}
 	var in struct {
 		Name  string `json:"name"`
 		USDOT string `json:"usdot"`
@@ -695,6 +736,9 @@ ORDER BY h.driver_id`)
 		h.Last10HResetAt = timeString(r10)
 		h.Last34HResetAt = timeString(r34)
 		h.CalculatedAt = calc.UTC().Format(time.RFC3339)
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, h.DriverID) {
+			continue
+		}
 		out = append(out, h)
 	}
 	writeJSON(w, 200, map[string]any{"hos": out})
@@ -738,6 +782,9 @@ WHERE d.active=true ORDER BY d.full_name`)
 		}
 		x.StatusSince = timeString(since)
 		x.GPSRecordedAt = timeString(gpsRecordedAt)
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, x.DriverID) {
+			continue
+		}
 		out = append(out, x)
 	}
 	writeJSON(w, 200, map[string]any{"drivers": out})
@@ -763,6 +810,11 @@ FROM alerts WHERE status=$1 ORDER BY created_at DESC LIMIT 1000`, status)
 			&a.EventID, &a.Status, &a.Owner, &a.Resolution); err != nil {
 			writeError(w, 500, err.Error())
 			return
+		}
+		if a.DriverID != "" {
+			if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, a.DriverID) {
+				continue
+			}
 		}
 		out = append(out, a)
 	}
@@ -1417,11 +1469,12 @@ func (s *Server) handleDriverLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"role":    "admin",
-		"service": "neksus-api",
-	})
+	i := identityFromContext(r.Context())
+	if i == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": "admin", "service": "neksus-api"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": i.Role, "username": i.Username, "full_name": i.FullName, "all_companies": i.AllCompanies, "service": "neksus-api"})
 }
 
 func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
@@ -1452,6 +1505,10 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	in.LicenseNumber = strings.TrimSpace(in.LicenseNumber)
 	in.Vehicle = strings.TrimSpace(in.Vehicle)
 	in.CompanyID = strings.TrimSpace(in.CompanyID)
+	if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(in.CompanyID) {
+		writeError(w, http.StatusForbidden, "company is outside your access")
+		return
+	}
 	creating := in.ID == ""
 	if !driverUsernamePattern.MatchString(in.Username) {
 		writeError(w, 400, "username must be 4-40 characters using letters, numbers, dot, underscore or dash")
@@ -2568,6 +2625,12 @@ func (s *Server) handleAdminAlert(w http.ResponseWriter, r *http.Request) {
 	if in.Priority == "" {
 		in.Priority = "attention"
 	}
+	if in.DriverID != "" {
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, in.DriverID) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+	}
 	var a AlertResponse
 	err := s.db.QueryRow(r.Context(), `
 INSERT INTO alerts(driver_id,kind,priority,title,detail,event_id)
@@ -2599,8 +2662,17 @@ func (h *Hub) broadcast(v any) {
 		clients = append(clients, c)
 	}
 	h.mu.RUnlock()
+	companyID := ""
+	if m, ok := v.(map[string]any); ok {
+		if x, ok := m["company_id"].(string); ok {
+			companyID = x
+		}
+	}
 	for _, c := range clients {
 		if !c.authed {
+			continue
+		}
+		if companyID != "" && c.identity != nil && !c.identity.companyAllowed(companyID) {
 			continue
 		}
 		c.mu.Lock()
@@ -2622,7 +2694,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if expectedToken == "" {
 		expectedToken = s.adminToken
 	}
-	c := &WSClient{conn: conn, authed: expectedToken == ""}
+	c := &WSClient{conn: conn, authed: expectedToken == "" && s.adminToken == "" && s.apiToken == ""}
+	if c.authed {
+		c.identity = &WebIdentity{Username: "legacy-open", Role: "viewer", AllCompanies: true, Legacy: true, CompanyIDs: map[string]bool{}}
+	}
 	s.hub.add(c)
 	defer s.hub.remove(c)
 	for {
@@ -2638,10 +2713,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		switch t {
 		case "authenticate":
 			token, _ := msg["token"].(string)
-			if expectedToken == "" || token == expectedToken {
+			var ident *WebIdentity
+			if x := s.legacyIdentity(token, false); x != nil {
+				ident = x
+			} else if x, err := s.loadWebIdentity(r.Context(), token); err == nil {
+				ident = x
+			}
+			if ident != nil {
 				c.authed = true
+				c.identity = ident
 				c.mu.Lock()
-				_ = c.conn.WriteJSON(map[string]any{"type": "authenticated"})
+				_ = c.conn.WriteJSON(map[string]any{"type": "authenticated", "role": ident.Role})
 				c.mu.Unlock()
 			} else {
 				c.mu.Lock()
@@ -2694,25 +2776,29 @@ func (s *Server) listenForChanges(ctx context.Context) {
 }
 
 func (s *Server) handleDBNotification(ctx context.Context, p notifyPayload) {
+	companyID := ""
+	if p.DriverID != "" {
+		companyID, _ = s.driverCompanyID(ctx, p.DriverID)
+	}
 	switch p.Table {
 	case "drivers":
-		s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID})
+		s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID, "company_id": companyID})
 	case "driver_live_state":
 		if x, err := s.queryLiveState(ctx, p.DriverID); err == nil {
-			s.hub.broadcast(map[string]any{"type": "fleet.driver.updated", "driver_id": p.DriverID, "data": x})
+			s.hub.broadcast(map[string]any{"type": "fleet.driver.updated", "driver_id": p.DriverID, "company_id": companyID, "data": x})
 		} else {
-			s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID})
+			s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID, "company_id": companyID})
 		}
 	case "driver_hos_current":
 		if h, err := s.queryHOS(ctx, p.DriverID); err == nil {
-			s.hub.broadcast(map[string]any{"type": "driver.hos.updated", "driver_id": p.DriverID, "data": h})
+			s.hub.broadcast(map[string]any{"type": "driver.hos.updated", "driver_id": p.DriverID, "company_id": companyID, "data": h})
 		}
 	case "duty_segments", "eld_events":
-		s.hub.broadcast(map[string]any{"type": "driver.log.updated", "driver_id": p.DriverID})
+		s.hub.broadcast(map[string]any{"type": "driver.log.updated", "driver_id": p.DriverID, "company_id": companyID})
 	case "alerts":
 		s.hub.broadcast(map[string]any{"type": "alerts.updated"})
 	case "driver_alarms":
-		s.hub.broadcast(map[string]any{"type": "driver.alarm.updated", "driver_id": p.DriverID, "alarm_id": p.ID})
+		s.hub.broadcast(map[string]any{"type": "driver.alarm.updated", "driver_id": p.DriverID, "company_id": companyID, "alarm_id": p.ID})
 	case "companies":
 		s.hub.broadcast(map[string]any{"type": "companies.updated", "company_id": p.ID})
 	}
