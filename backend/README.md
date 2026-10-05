@@ -319,3 +319,8 @@ Behavior:
 - Swap transfers exact seconds across the boundary between two adjacent duty segments and preserves the combined duration.
 
 This analyzer is prototype operational logic. It is not a substitute for validated ECM/ELD vehicle-motion data in a certified production ELD.
+
+## v13 continuous episode metadata
+`GET /v1/driver/logs/{date}` and the admin log endpoint now enrich daily `duty_segments` with `episode_start_date`, `episode_start_second`, `episode_end_date`, `episode_end_second`, `episode_duration_seconds`, and `episode_open`. Adjacent same-status fragments that touch across midnight are treated as one display episode while the stored per-day fragments remain intact for daily logs and edits.
+
+New-driver seeding now starts exactly 168 hours before creation and no longer adds the user-visible "Initial seven-day OFF duty history" note. The migration clears that legacy note from existing seeded rows.

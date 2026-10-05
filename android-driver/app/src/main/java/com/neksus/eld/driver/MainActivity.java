@@ -3,8 +3,6 @@ package com.neksus.eld.driver;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -186,31 +184,6 @@ public class MainActivity extends Activity {
             runOnUiThread(MainActivity.this::startDriveService);
         }
 
-        @JavascriptInterface
-        public void openMap(String latitude, String longitude) {
-            runOnUiThread(() -> {
-                try {
-                    double lat = Double.parseDouble(latitude);
-                    double lon = Double.parseDouble(longitude);
-                    Uri uri = Uri.parse("geo:" + lat + "," + lon + "?q=" + lat + "," + lon);
-                    Intent intent = new Intent(Intent.ACTION_VIEW, uri);
-                    try {
-                        startActivity(intent);
-                    } catch (Exception noMapApp) {
-                        Uri web = Uri.parse("https://www.google.com/maps/search/?api=1&query=" + lat + "," + lon);
-                        startActivity(new Intent(Intent.ACTION_VIEW, web));
-                    }
-                } catch (Exception ignored) {}
-            });
-        }
-
-        @JavascriptInterface
-        public void copyCoordinates(String latitude, String longitude) {
-            try {
-                ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Coordinates", latitude + ", " + longitude));
-            } catch (Exception ignored) {}
-        }
     }
 
     @Override

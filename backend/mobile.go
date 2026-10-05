@@ -17,7 +17,7 @@ import (
 const (
 	autoDriveStartSpeedMPS = 2.2352  // 5 mph
 	autoDriveStopSpeedMPS  = 0.89408 // 2 mph
-	autoDriveStartSamples  = 3
+	autoDriveStartSamples  = 2
 	autoDriveStopHold      = 5 * time.Minute
 )
 
@@ -219,6 +219,24 @@ func (s *Server) handleDriverTelemetry(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
+	// Some Android/mock providers move coordinates correctly but report speed as zero.
+	// Derive a fallback speed from the previous GPS fix so sustained real movement can still enter DR.
+	var previousLat, previousLon float64
+	var previousRecordedAt *time.Time
+	_ = tx.QueryRow(r.Context(), `SELECT latitude,longitude,gps_recorded_at FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&previousLat, &previousLon, &previousRecordedAt)
+	effectiveSpeedMPS := math.Max(0, in.SpeedMPS)
+	if previousRecordedAt != nil && validCoordinates(previousLat, previousLon) && at.After(*previousRecordedAt) {
+		dt := at.Sub(*previousRecordedAt).Seconds()
+		if dt >= 1 && dt <= 120 {
+			distanceMeters := haversineMiles(previousLat, previousLon, in.Latitude, in.Longitude) * 1609.344
+			derived := distanceMeters / dt
+			if derived >= 0 && derived <= 80 && derived > effectiveSpeedMPS {
+				effectiveSpeedMPS = derived
+			}
+		}
+	}
+	in.SpeedMPS = effectiveSpeedMPS
+
 	// Update live GPS first, preserving the current duty status.
 	_, err = tx.Exec(r.Context(), `
 INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,odometer_miles,gps_accuracy_meters,gps_speed_mps,gps_recorded_at,status_since,revision)
@@ -255,7 +273,7 @@ FROM driver_motion_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&movingS
 
 	started, ended := false, false
 	if activeDriveID == nil || *activeDriveID == "" {
-		if in.SpeedMPS >= autoDriveStartSpeedMPS && (in.AccuracyMeters <= 100 || in.AccuracyMeters == 0) {
+		if in.SpeedMPS >= autoDriveStartSpeedMPS && (in.AccuracyMeters <= 200 || in.AccuracyMeters == 0) {
 			if movingSamples == 0 || movingStartedAt == nil {
 				t := at
 				movingStartedAt = &t

@@ -339,3 +339,7 @@ CREATE INDEX IF NOT EXISTS eld_events_drive_session_idx ON eld_events(drive_sess
 ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION NOT NULL DEFAULT 0;
 ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION NOT NULL DEFAULT 0;
 ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS gps_accuracy_meters DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+-- v13: remove legacy synthetic seed-note labels. The OFF history remains intact.
+UPDATE duty_segments SET note='' WHERE note='Initial seven-day OFF duty history';
+UPDATE eld_events SET note='' WHERE note='Initial OFF duty status';

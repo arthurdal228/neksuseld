@@ -36,11 +36,15 @@ public class DriveTrackingService extends Service implements LocationListener {
     private static final String CHANNEL = "neksus_drive_analyzer";
     private static final int NOTIFICATION_ID = 4200;
     private final ExecutorService network = Executors.newSingleThreadExecutor();
+    private final ExecutorService geocoderWorker = Executors.newSingleThreadExecutor();
     private LocationManager locationManager;
     private long lastSentAt = 0L;
+    private Location lastMotionLocation;
+    private long lastMotionWallMs = 0L;
     private String lastLocationLabel = "";
     private double lastLabelLat = 0;
     private double lastLabelLon = 0;
+    private volatile boolean geocodePending = false;
 
     @Override
     public void onCreate() {
@@ -71,14 +75,21 @@ public class DriveTrackingService extends Service implements LocationListener {
         if (locationManager == null) return;
         try {
             locationManager.removeUpdates(this);
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 8000L, 5f, this);
+            boolean gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+            boolean networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+            if (gpsEnabled) {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 3000L, 0f, this);
             }
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 15000L, 15f, this);
+            if (networkEnabled) {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000L, 0f, this);
             }
+            // PASSIVE also observes fixes injected through fused/mock providers used by test tools.
+            try {
+                locationManager.requestLocationUpdates(LocationManager.PASSIVE_PROVIDER, 2500L, 0f, this);
+            } catch (Exception ignored) {}
             Location last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             if (last == null) last = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            if (last == null) last = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
             if (last != null) onLocationChanged(last);
         } catch (SecurityException ignored) {
             stopSelf();
@@ -89,58 +100,107 @@ public class DriveTrackingService extends Service implements LocationListener {
     public void onLocationChanged(Location location) {
         if (location == null) return;
         long now = System.currentTimeMillis();
-        String locationText = resolveLocationText(location.getLatitude(), location.getLongitude());
-        persistLocation(location, locationText);
-        double mph = Math.max(0, location.getSpeed()) * 2.2369362921;
+        // Calculate movement immediately. Reverse geocoding must never block DR detection.
+        double effectiveSpeedMps = effectiveSpeedMps(location);
+        String locationText = cachedLocationText(location.getLatitude(), location.getLongitude());
+        persistLocation(location, locationText, effectiveSpeedMps);
+        scheduleReverseGeocode(location.getLatitude(), location.getLongitude());
+        double mph = effectiveSpeedMps * 2.2369362921;
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.notify(NOTIFICATION_ID, notification(String.format(Locale.US, "GPS active · %.1f mph", mph)));
-        if (now - lastSentAt < 7000L) return;
+        if (now - lastSentAt < 2500L) return;
         lastSentAt = now;
         String auth = token();
         if (auth.isEmpty()) return;
-        network.execute(() -> sendTelemetry(auth, location, locationText));
+        network.execute(() -> sendTelemetry(auth, location, locationText, effectiveSpeedMps));
     }
 
-    private void persistLocation(Location l, String locationText) {
+    private double effectiveSpeedMps(Location current) {
+        double reported = current.hasSpeed() ? Math.max(0, current.getSpeed()) : 0;
+        double derived = 0;
+        long currentWall = System.currentTimeMillis();
+        if (lastMotionLocation != null) {
+            long dtMs = currentWall - lastMotionWallMs;
+            if (dtMs >= 1000L && dtMs <= 120000L) {
+                float meters = lastMotionLocation.distanceTo(current);
+                double candidate = meters / (dtMs / 1000.0);
+                // Ignore impossible coordinate jumps, but accept mock/provider movement with no speed field.
+                if (candidate >= 0 && candidate <= 80.0) derived = candidate;
+            }
+        }
+        if (lastMotionLocation == null || currentWall >= lastMotionWallMs) {
+            lastMotionLocation = new Location(current);
+            lastMotionWallMs = currentWall;
+        }
+        return Math.max(reported, derived);
+    }
+
+    private void persistLocation(Location l, String locationText, double effectiveSpeedMps) {
         SharedPreferences.Editor e = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit();
         e.putLong(MainActivity.PREF_LAST_LAT, Double.doubleToRawLongBits(l.getLatitude()));
         e.putLong(MainActivity.PREF_LAST_LON, Double.doubleToRawLongBits(l.getLongitude()));
         e.putLong(MainActivity.PREF_LAST_ACCURACY, Double.doubleToRawLongBits(l.hasAccuracy() ? l.getAccuracy() : 0));
-        e.putLong(MainActivity.PREF_LAST_SPEED, Double.doubleToRawLongBits(l.hasSpeed() ? l.getSpeed() : 0));
-        e.putLong(MainActivity.PREF_LAST_LOCATION_TIME, l.getTime() > 0 ? l.getTime() : System.currentTimeMillis());
+        e.putLong(MainActivity.PREF_LAST_SPEED, Double.doubleToRawLongBits(effectiveSpeedMps));
+        e.putLong(MainActivity.PREF_LAST_LOCATION_TIME, System.currentTimeMillis());
         e.putString(MainActivity.PREF_LAST_LOCATION_TEXT, locationText);
         e.apply();
     }
 
-    private String resolveLocationText(double lat, double lon) {
-        if (!lastLocationLabel.isEmpty() && Math.abs(lat - lastLabelLat) < 0.002 && Math.abs(lon - lastLabelLon) < 0.002) {
+    private String cachedLocationText(double lat, double lon) {
+        if (!lastLocationLabel.isEmpty() && Math.abs(lat - lastLabelLat) < 0.02 && Math.abs(lon - lastLabelLon) < 0.02) {
             return lastLocationLabel;
         }
-        String label = "Location unavailable";
-        try {
-            if (Geocoder.isPresent()) {
-                Geocoder geocoder = new Geocoder(this, Locale.US);
-                List<Address> list = geocoder.getFromLocation(lat, lon, 1);
-                if (list != null && !list.isEmpty()) {
-                    Address a = list.get(0);
-                    String city = a.getLocality();
-                    if (city == null || city.trim().isEmpty()) city = a.getSubAdminArea();
-                    if (city == null || city.trim().isEmpty()) city = a.getFeatureName();
-                    String state = a.getAdminArea();
-                    StringBuilder b = new StringBuilder();
-                    if (city != null && !city.trim().isEmpty()) b.append(city.trim());
-                    if (state != null && !state.trim().isEmpty()) {
-                        if (b.length() > 0) b.append(", ");
-                        b.append(state.trim());
-                    }
-                    if (b.length() > 0) label = b.toString();
+        SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        String saved = prefs.getString(MainActivity.PREF_LAST_LOCATION_TEXT, "");
+        double savedLat = Double.longBitsToDouble(prefs.getLong(MainActivity.PREF_LAST_LAT, Double.doubleToLongBits(0)));
+        double savedLon = Double.longBitsToDouble(prefs.getLong(MainActivity.PREF_LAST_LON, Double.doubleToLongBits(0)));
+        if (saved != null && !saved.trim().isEmpty() && Math.abs(lat - savedLat) < 0.02 && Math.abs(lon - savedLon) < 0.02) {
+            return saved;
+        }
+        return "Location unavailable";
+    }
+
+    private void scheduleReverseGeocode(double lat, double lon) {
+        if (geocodePending) return;
+        if (!lastLocationLabel.isEmpty() && Math.abs(lat - lastLabelLat) < 0.003 && Math.abs(lon - lastLabelLon) < 0.003) return;
+        geocodePending = true;
+        geocoderWorker.execute(() -> {
+            try {
+                String label = reverseGeocode(lat, lon);
+                if (!label.isEmpty()) {
+                    lastLocationLabel = label;
+                    lastLabelLat = lat;
+                    lastLabelLon = lon;
+                    getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                            .putString(MainActivity.PREF_LAST_LOCATION_TEXT, label).apply();
                 }
+            } finally {
+                geocodePending = false;
             }
-        } catch (Exception ignored) {}
-        lastLocationLabel = label;
-        lastLabelLat = lat;
-        lastLabelLon = lon;
-        return label;
+        });
+    }
+
+    private String reverseGeocode(double lat, double lon) {
+        try {
+            if (!Geocoder.isPresent()) return "";
+            Geocoder geocoder = new Geocoder(this, Locale.US);
+            List<Address> list = geocoder.getFromLocation(lat, lon, 1);
+            if (list == null || list.isEmpty()) return "";
+            Address a = list.get(0);
+            String city = a.getLocality();
+            if (city == null || city.trim().isEmpty()) city = a.getSubAdminArea();
+            if (city == null || city.trim().isEmpty()) city = a.getFeatureName();
+            String state = a.getAdminArea();
+            StringBuilder b = new StringBuilder();
+            if (city != null && !city.trim().isEmpty()) b.append(city.trim());
+            if (state != null && !state.trim().isEmpty()) {
+                if (b.length() > 0) b.append(", ");
+                b.append(state.trim());
+            }
+            return b.toString();
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private String token() {
@@ -152,17 +212,17 @@ public class DriveTrackingService extends Service implements LocationListener {
         return Double.longBitsToDouble(p.getLong(MainActivity.PREF_ODOMETER, Double.doubleToLongBits(0)));
     }
 
-    private void sendTelemetry(String auth, Location l, String locationText) {
+    private void sendTelemetry(String auth, Location l, String locationText, double effectiveSpeedMps) {
         HttpURLConnection conn = null;
         try {
             JSONObject body = new JSONObject();
             body.put("latitude", l.getLatitude());
             body.put("longitude", l.getLongitude());
             body.put("accuracy_meters", l.hasAccuracy() ? l.getAccuracy() : 0);
-            body.put("speed_mps", l.hasSpeed() ? Math.max(0, l.getSpeed()) : 0);
+            body.put("speed_mps", effectiveSpeedMps);
             body.put("odometer_miles", odometer());
             body.put("location_text", locationText);
-            body.put("recorded_at", isoTime(l.getTime() > 0 ? l.getTime() : System.currentTimeMillis()));
+            body.put("recorded_at", isoTime(System.currentTimeMillis()));
             byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
             conn = (HttpURLConnection) new URL(API + "/v1/driver/telemetry").openConnection();
             conn.setRequestMethod("POST");
@@ -223,6 +283,7 @@ public class DriveTrackingService extends Service implements LocationListener {
             try { locationManager.removeUpdates(this); } catch (SecurityException ignored) {}
         }
         network.shutdownNow();
+        geocoderWorker.shutdownNow();
         super.onDestroy();
     }
 

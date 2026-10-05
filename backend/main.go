@@ -131,23 +131,29 @@ type LiveStateResponse struct {
 }
 
 type SegmentResponse struct {
-	ID               string  `json:"id"`
-	StartMinute      int     `json:"start_minute"`
-	StartSecond      int     `json:"start_second"`
-	EndMinute        *int    `json:"end_minute,omitempty"`
-	EndSecond        *int    `json:"end_second,omitempty"`
-	DutyStatus       string  `json:"duty_status"`
-	SpecialStatus    string  `json:"special_status"`
-	Note             string  `json:"note"`
-	Origin           string  `json:"origin"`
-	Edited           bool    `json:"edited"`
-	Revision         int64   `json:"revision"`
-	LocationText     string  `json:"location_text"`
-	OdometerMiles    float64 `json:"odometer_miles"`
-	EngineHours      float64 `json:"engine_hours"`
-	TrailerNumber    string  `json:"trailer_number"`
-	ShippingDocument string  `json:"shipping_document"`
-	EditReason       string  `json:"edit_reason"`
+	ID                     string  `json:"id"`
+	StartMinute            int     `json:"start_minute"`
+	StartSecond            int     `json:"start_second"`
+	EndMinute              *int    `json:"end_minute,omitempty"`
+	EndSecond              *int    `json:"end_second,omitempty"`
+	DutyStatus             string  `json:"duty_status"`
+	SpecialStatus          string  `json:"special_status"`
+	Note                   string  `json:"note"`
+	Origin                 string  `json:"origin"`
+	Edited                 bool    `json:"edited"`
+	Revision               int64   `json:"revision"`
+	LocationText           string  `json:"location_text"`
+	OdometerMiles          float64 `json:"odometer_miles"`
+	EngineHours            float64 `json:"engine_hours"`
+	TrailerNumber          string  `json:"trailer_number"`
+	ShippingDocument       string  `json:"shipping_document"`
+	EditReason             string  `json:"edit_reason"`
+	EpisodeStartDate       string  `json:"episode_start_date,omitempty"`
+	EpisodeStartSecond     int     `json:"episode_start_second,omitempty"`
+	EpisodeEndDate         string  `json:"episode_end_date,omitempty"`
+	EpisodeEndSecond       int     `json:"episode_end_second,omitempty"`
+	EpisodeDurationSeconds int     `json:"episode_duration_seconds,omitempty"`
+	EpisodeOpen            bool    `json:"episode_open,omitempty"`
 }
 
 type LogEditHistoryResponse struct {
@@ -787,6 +793,167 @@ FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`,
 	return segs, rows.Err()
 }
 
+type episodeFragment struct {
+	id           string
+	date         string
+	dayIndex     int
+	startSecond  int
+	endSecond    int
+	status       string
+	special      string
+	open         bool
+	episodeStart int
+	episodeEnd   int
+}
+
+func parseLogDateUTC(v string) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02", v, time.UTC)
+}
+
+func logDayDistance(a, b string) int {
+	ta, errA := parseLogDateUTC(a)
+	tb, errB := parseLogDateUTC(b)
+	if errA != nil || errB != nil {
+		return 0
+	}
+	return int(tb.Sub(ta).Hours() / 24)
+}
+
+func absEpisodePosition(baseDate, date string, second int) int {
+	return logDayDistance(baseDate, date)*86400 + second
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func splitEpisodePosition(baseDate string, absolute int) (string, int) {
+	base, err := parseLogDateUTC(baseDate)
+	if err != nil {
+		return baseDate, 0
+	}
+	day := absolute / 86400
+	second := absolute % 86400
+	if second < 0 {
+		second += 86400
+		day--
+	}
+	return base.AddDate(0, 0, day).Format("2006-01-02"), second
+}
+
+// enrichSegmentEpisodes keeps each daily graph fragment intact while attaching the
+// full continuous duty-status episode across midnight boundaries. This lets the
+// UI show 13h44m (or multi-day OFF duty) instead of resetting duration at midnight.
+func (s *Server) enrichSegmentEpisodes(ctx context.Context, driverID, requestedDate, timezone string, segs []SegmentResponse) []SegmentResponse {
+	if len(segs) == 0 {
+		return segs
+	}
+	requested, err := parseLogDateUTC(requestedDate)
+	if err != nil {
+		return segs
+	}
+	windowStart := requested.AddDate(0, 0, -35).Format("2006-01-02")
+	windowEnd := requested.AddDate(0, 0, 35).Format("2006-01-02")
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	localNow := time.Now().In(loc)
+	today := localNow.Format("2006-01-02")
+	nowSecond := localNow.Hour()*3600 + localNow.Minute()*60 + localNow.Second()
+
+	rows, err := s.db.Query(ctx, `
+SELECT id::text, to_char(log_date,'YYYY-MM-DD'), COALESCE(start_second,start_minute*60),
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status
+FROM duty_segments
+WHERE driver_id=$1 AND log_date BETWEEN $2::date AND $3::date
+ORDER BY log_date, COALESCE(start_second,start_minute*60), id`, driverID, windowStart, windowEnd)
+	if err != nil {
+		return segs
+	}
+	defer rows.Close()
+	frags := make([]episodeFragment, 0, 64)
+	baseDate := windowStart
+	for rows.Next() {
+		var f episodeFragment
+		var end *int
+		if err := rows.Scan(&f.id, &f.date, &f.startSecond, &end, &f.status, &f.special); err != nil {
+			return segs
+		}
+		f.dayIndex = logDayDistance(baseDate, f.date)
+		if end == nil {
+			f.open = true
+			if f.date == today {
+				f.endSecond = nowSecond
+			} else if f.date < today {
+				f.endSecond = 86400
+			} else {
+				f.endSecond = f.startSecond
+			}
+		} else {
+			f.endSecond = *end
+		}
+		if f.endSecond < f.startSecond {
+			f.endSecond = f.startSecond
+		}
+		f.episodeStart = absEpisodePosition(baseDate, f.date, f.startSecond)
+		f.episodeEnd = absEpisodePosition(baseDate, f.date, f.endSecond)
+		frags = append(frags, f)
+	}
+	if len(frags) == 0 {
+		return segs
+	}
+
+	// Build contiguous groups. Same-status fragments touching at midnight are one episode.
+	groupStart := 0
+	for i := 0; i < len(frags); i++ {
+		if i > 0 {
+			p := frags[i-1]
+			c := frags[i]
+			contiguous := absInt(p.episodeEnd-c.episodeStart) <= 2 && p.status == c.status && p.special == c.special
+			if !contiguous {
+				startAbs := frags[groupStart].episodeStart
+				endAbs := frags[i-1].episodeEnd
+				for j := groupStart; j < i; j++ {
+					frags[j].episodeStart = startAbs
+					frags[j].episodeEnd = endAbs
+				}
+				groupStart = i
+			}
+		}
+	}
+	startAbs := frags[groupStart].episodeStart
+	endAbs := frags[len(frags)-1].episodeEnd
+	for j := groupStart; j < len(frags); j++ {
+		frags[j].episodeStart = startAbs
+		frags[j].episodeEnd = endAbs
+	}
+
+	byID := make(map[string]episodeFragment, len(frags))
+	for _, f := range frags {
+		byID[f.id] = f
+	}
+	for i := range segs {
+		f, ok := byID[segs[i].ID]
+		if !ok {
+			continue
+		}
+		startDate, startSecond := splitEpisodePosition(baseDate, f.episodeStart)
+		endDate, endSecond := splitEpisodePosition(baseDate, f.episodeEnd)
+		segs[i].EpisodeStartDate = startDate
+		segs[i].EpisodeStartSecond = startSecond
+		segs[i].EpisodeEndDate = endDate
+		segs[i].EpisodeEndSecond = endSecond
+		segs[i].EpisodeDurationSeconds = f.episodeEnd - f.episodeStart
+		segs[i].EpisodeOpen = f.open || (endDate == today && endSecond >= nowSecond-2)
+	}
+	return segs
+}
+
 func (s *Server) repairCurrentLogIfEmpty(ctx context.Context, id, date, timezone string) error {
 	loc, err := time.LoadLocation(timezone)
 	if err != nil {
@@ -879,6 +1046,8 @@ func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	segs = s.enrichSegmentEpisodes(r.Context(), id, date, timezone, segs)
 
 	events := []EventResponse{}
 	erows, err := s.db.Query(r.Context(), `
@@ -1385,28 +1554,38 @@ ON CONFLICT(driver_id) DO NOTHING`, in.ID)
 			loc = time.UTC
 		}
 		today := time.Now().In(loc)
-		for daysAgo := 6; daysAgo >= 0; daysAgo-- {
-			day := today.AddDate(0, 0, -daysAgo).Format("2006-01-02")
-			if daysAgo == 0 {
+		historyStart := today.AddDate(0, 0, -7)
+		historyStartSecond := historyStart.Hour()*3600 + historyStart.Minute()*60 + historyStart.Second()
+		for dayCursor := time.Date(historyStart.Year(), historyStart.Month(), historyStart.Day(), 0, 0, 0, 0, loc); !dayCursor.After(time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)); dayCursor = dayCursor.AddDate(0, 0, 1) {
+			day := dayCursor.Format("2006-01-02")
+			startSecond := 0
+			startMinute := 0
+			if day == historyStart.Format("2006-01-02") {
+				startSecond = historyStartSecond
+				startMinute = historyStartSecond / 60
+			}
+			if day == today.Format("2006-01-02") {
 				_, err = tx.Exec(r.Context(), `
-INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin)
-SELECT $1,$2,0,NULL,'OFF','Initial seven-day OFF duty history','System'
-WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day)
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin)
+SELECT $1,$2,$3,$4,NULL,NULL,'OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day, startMinute, startSecond)
 			} else {
 				_, err = tx.Exec(r.Context(), `
-INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin)
-SELECT $1,$2,0,1440,'OFF','Initial seven-day OFF duty history','System'
-WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day)
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin)
+SELECT $1,$2,$3,$4,1440,86400,'OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day, startMinute, startSecond)
 			}
 			if err != nil {
 				writeError(w, 500, err.Error())
 				return
 			}
 		}
+		oldestDay := historyStart.Format("2006-01-02")
+		oldestMinute := historyStartSecond / 60
 		_, err = tx.Exec(r.Context(), `
 INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,origin)
-SELECT $1,$2,0,now(),'duty_status','OFF','Initial OFF duty status','System'
-WHERE NOT EXISTS (SELECT 1 FROM eld_events WHERE driver_id=$1 AND log_date=$2 AND minute=0 AND duty_status='OFF')`, in.ID, today.Format("2006-01-02"))
+SELECT $1,$2,$3,NULL,'duty_status','OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM eld_events WHERE driver_id=$1 AND log_date=$2 AND minute=$3 AND duty_status='OFF')`, in.ID, oldestDay, oldestMinute)
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
