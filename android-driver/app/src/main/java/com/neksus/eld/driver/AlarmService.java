@@ -99,11 +99,10 @@ public class AlarmService extends Service {
         sync.setDescription("Keeps NEKSUS driver alarms connected while signed in");
         nm.createNotificationChannel(sync);
 
-        createAlarmChannel(nm, "alert", "Alert", R.raw.neksus_alert, new long[]{0, 250, 120, 250});
-        createAlarmChannel(nm, "urgent", "Urgent", R.raw.neksus_urgent, new long[]{0, 450, 120, 450, 120, 700});
-        createAlarmChannel(nm, "chime", "Chime", R.raw.neksus_chime, new long[]{0, 180, 100, 180});
-        createAlarmChannel(nm, "bell", "Bell", R.raw.neksus_bell, new long[]{0, 300, 120, 300});
-        createAlarmChannel(nm, "pulse", "Pulse", R.raw.neksus_pulse, new long[]{0, 140, 90, 140, 90, 140});
+        createAlarmChannel(nm, "phone_ring", "Phone Ring", R.raw.neksus_phone_ring, new long[]{0, 500, 250, 500, 250, 900});
+        createAlarmChannel(nm, "rooster", "Rooster", R.raw.neksus_rooster, new long[]{0, 700, 250, 700});
+        createAlarmChannel(nm, "siren", "Siren", R.raw.neksus_siren, new long[]{0, 900, 200, 900});
+        createAlarmChannel(nm, "alarm", "Alarm", R.raw.neksus_alarm, new long[]{0, 600, 180, 600, 180, 600});
     }
 
     private void createAlarmChannel(NotificationManager nm, String key, String label, int rawResId, long[] vibration) {
@@ -158,9 +157,9 @@ public class AlarmService extends Service {
         String id = alarm.optString("id", "alarm");
         String title = alarm.optString("title", "NEKSUS alert");
         String message = alarm.optString("message", "Driver notification");
-        String ringtone = alarm.optString("ringtone", "alert").toLowerCase(Locale.US);
-        if (!(ringtone.equals("alert") || ringtone.equals("urgent") || ringtone.equals("chime") || ringtone.equals("bell") || ringtone.equals("pulse"))) {
-            ringtone = "alert";
+        String ringtone = alarm.optString("ringtone", "phone_ring").toLowerCase(Locale.US);
+        if (!(ringtone.equals("phone_ring") || ringtone.equals("rooster") || ringtone.equals("siren") || ringtone.equals("alarm"))) {
+            ringtone = "phone_ring";
         }
         Intent open = new Intent(this, MainActivity.class);
         open.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);

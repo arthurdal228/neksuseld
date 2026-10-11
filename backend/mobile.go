@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	autoDriveStartSpeedMPS = 2.2352  // 5 mph
-	autoDriveStopSpeedMPS  = 0.89408 // 2 mph
-	autoDriveStartSamples  = 2
-	autoDriveStopHold      = 5 * time.Minute
+	autoDriveStartSpeedMPS = 1.34112 // 3 mph
+	autoDriveStopSpeedMPS  = 0.44704 // treat sub-1 mph GPS jitter as stopped
+	autoDriveStartSamples  = 1
+	autoDriveStopHold      = 60 * time.Second
 )
 
 type telemetryInput struct {
@@ -29,6 +29,7 @@ type telemetryInput struct {
 	OdometerMiles  float64 `json:"odometer_miles"`
 	LocationText   string  `json:"location_text"`
 	RecordedAt     string  `json:"recorded_at"`
+	AutoStopStatus string  `json:"auto_stop_status"`
 }
 
 func validCoordinates(lat, lon float64) bool {
@@ -208,6 +209,10 @@ func (s *Server) handleDriverTelemetry(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.LocationText) == "" {
 		in.LocationText = "Location unavailable"
 	}
+	in.AutoStopStatus = strings.ToUpper(strings.TrimSpace(in.AutoStopStatus))
+	if in.AutoStopStatus != "OFF" && in.AutoStopStatus != "ON" {
+		in.AutoStopStatus = "ON"
+	}
 	var serverOdometer float64
 	_ = s.db.QueryRow(r.Context(), `SELECT COALESCE(odometer_miles,0) FROM driver_live_state WHERE driver_id=$1`, driverID).Scan(&serverOdometer)
 	in.OdometerMiles = serverOdometer
@@ -273,7 +278,7 @@ FROM driver_motion_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&movingS
 
 	started, ended := false, false
 	if activeDriveID == nil || *activeDriveID == "" {
-		if in.SpeedMPS >= autoDriveStartSpeedMPS && (in.AccuracyMeters <= 200 || in.AccuracyMeters == 0) {
+		if in.SpeedMPS >= autoDriveStartSpeedMPS && (in.AccuracyMeters <= 300 || in.AccuracyMeters == 0) {
 			if movingSamples == 0 || movingStartedAt == nil {
 				t := at
 				movingStartedAt = &t
@@ -349,7 +354,7 @@ ORDER BY recorded_at DESC LIMIT 1`, *activeDriveID, endAt).Scan(&endLat, &endLon
 				if endOdo > 0 {
 					_ = s.normalizeDriveTx(r.Context(), tx, driverID, *activeDriveID, endOdo)
 				}
-				_, _, _, _, e = s.transitionDriverStatusTx(r.Context(), tx, driverID, "ON", "Automatic stop after driving", "DriveAnalyzer", endLocation, endLat, endLon, endOdo, endAccuracy, endSpeed, endAt, true)
+				_, _, _, _, e = s.transitionDriverStatusTx(r.Context(), tx, driverID, in.AutoStopStatus, "Automatic stop after driving", "DriveAnalyzer", endLocation, endLat, endLon, endOdo, endAccuracy, endSpeed, endAt, true)
 				if e != nil {
 					writeError(w, 500, e.Error())
 					return
@@ -428,7 +433,7 @@ func (s *Server) handleDriverDriveState(w http.ResponseWriter, r *http.Request) 
 			pending = d
 		}
 	}
-	writeJSON(w, 200, map[string]any{"active": active, "pending": pending, "analyzer": map[string]any{"start_speed_mph": 5, "start_samples": autoDriveStartSamples, "stop_speed_mph": 2, "stop_hold_seconds": int(autoDriveStopHold.Seconds())}})
+	writeJSON(w, 200, map[string]any{"active": active, "pending": pending, "analyzer": map[string]any{"start_speed_mph": 3, "start_samples": autoDriveStartSamples, "stop_speed_mph": 0, "stop_hold_seconds": int(autoDriveStopHold.Seconds())}})
 }
 
 func (s *Server) handleDriverNormalizeDrive(w http.ResponseWriter, r *http.Request) {
@@ -762,4 +767,33 @@ func driverCurrentDateServer(ctx context.Context, q interface {
 		loc = time.UTC
 	}
 	return time.Now().In(loc).Format("2006-01-02")
+}
+
+// finishActiveDriveSessionTx closes an automatic drive so a stopped driver can choose a manual status
+// before the one-minute automatic fallback fires.
+func (s *Server) finishActiveDriveSessionTx(ctx context.Context, tx pgx.Tx, driverID string, at time.Time, lat, lon, accuracy, speed float64, locationText string) (bool, error) {
+	var driveID string
+	var odo float64
+	err := tx.QueryRow(ctx, `SELECT id::text FROM drive_sessions WHERE driver_id=$1 AND state='active' ORDER BY started_at DESC LIMIT 1 FOR UPDATE`, driverID).Scan(&driveID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_ = tx.QueryRow(ctx, `SELECT COALESCE(odometer_miles,0) FROM driver_live_state WHERE driver_id=$1`, driverID).Scan(&odo)
+	_, _, endSecond, _, err := localDriverMoment(ctx, tx, driverID, at)
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE drive_sessions SET state='pending',ended_at=$2,end_second=$3,end_latitude=$4,end_longitude=$5,end_location_text=$6,end_odometer_miles=$7 WHERE id=$1::uuid`, driveID, at, endSecond, lat, lon, locationText, odo); err != nil {
+		return false, err
+	}
+	if odo > 0 {
+		_ = s.normalizeDriveTx(ctx, tx, driverID, driveID, odo)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE driver_motion_state SET active_drive_id=NULL,stopped_since=NULL,moving_samples=0,moving_started_at=NULL,last_speed_mps=$2,updated_at=now() WHERE driver_id=$1`, driverID, speed); err != nil {
+		return false, err
+	}
+	return true, nil
 }

@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS driver_alarms (
     driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
     title TEXT NOT NULL DEFAULT 'NEKSUS alert',
     message TEXT NOT NULL DEFAULT '',
-    ringtone TEXT NOT NULL DEFAULT 'alert',
+    ringtone TEXT NOT NULL DEFAULT 'phone_ring',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at TIMESTAMPTZ,
     acknowledged_at TIMESTAMPTZ
@@ -344,6 +344,12 @@ ALTER TABLE eld_events ADD COLUMN IF NOT EXISTS gps_accuracy_meters DOUBLE PRECI
 UPDATE duty_segments SET note='' WHERE note='Initial seven-day OFF duty history';
 UPDATE eld_events SET note='' WHERE note='Initial OFF duty status';
 
+ALTER TABLE driver_alarms ALTER COLUMN ringtone SET DEFAULT 'phone_ring';
+UPDATE driver_alarms
+SET ringtone='phone_ring'
+WHERE lower(ringtone) NOT IN ('phone_ring','rooster','siren','alarm');
+
+
 -- v14: NEKSUS Control / operator web accounts.
 CREATE TABLE IF NOT EXISTS web_users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -392,3 +398,31 @@ CREATE INDEX IF NOT EXISTS web_activity_user_idx ON web_activity(user_id,created
 DROP TRIGGER IF EXISTS trg_web_users_touch ON web_users;
 CREATE TRIGGER trg_web_users_touch BEFORE UPDATE ON web_users
 FOR EACH ROW EXECUTE FUNCTION neksus_touch_updated_at();
+
+-- v15: first-class company vehicles and server-side fleet assignment rules.
+CREATE TABLE IF NOT EXISTS vehicles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    unit_number TEXT NOT NULL,
+    vin TEXT NOT NULL DEFAULT '',
+    vehicle_type TEXT NOT NULL DEFAULT 'TRACTOR',
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(company_id, unit_number)
+);
+CREATE INDEX IF NOT EXISTS vehicles_company_active_idx ON vehicles(company_id, active, unit_number);
+
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS vehicle_id UUID REFERENCES vehicles(id) ON DELETE SET NULL;
+
+-- Preserve existing truck assignments by materializing a vehicle inside the driver's own company.
+INSERT INTO vehicles(company_id,unit_number,vehicle_type,active)
+SELECT DISTINCT d.company_id,d.truck_unit,COALESCE(NULLIF(d.vehicle_type,''),'TRACTOR'),true
+FROM drivers d
+WHERE d.company_id IS NOT NULL AND trim(d.truck_unit)<>''
+ON CONFLICT(company_id,unit_number) DO UPDATE SET active=true;
+
+UPDATE drivers d
+SET vehicle_id=v.id
+FROM vehicles v
+WHERE d.vehicle_id IS NULL AND d.company_id=v.company_id AND d.truck_unit=v.unit_number;

@@ -212,6 +212,11 @@ public class DriveTrackingService extends Service implements LocationListener {
         return Double.longBitsToDouble(p.getLong(MainActivity.PREF_ODOMETER, Double.doubleToLongBits(0)));
     }
 
+    private String autoStopStatus() {
+        String v = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).getString(MainActivity.PREF_AUTO_STOP_STATUS, "ON");
+        return "OFF".equalsIgnoreCase(v) ? "OFF" : "ON";
+    }
+
     private void sendTelemetry(String auth, Location l, String locationText, double effectiveSpeedMps) {
         HttpURLConnection conn = null;
         try {
@@ -220,6 +225,7 @@ public class DriveTrackingService extends Service implements LocationListener {
             body.put("longitude", l.getLongitude());
             body.put("accuracy_meters", l.hasAccuracy() ? l.getAccuracy() : 0);
             body.put("speed_mps", effectiveSpeedMps);
+            body.put("auto_stop_status", autoStopStatus());
             body.put("odometer_miles", odometer());
             body.put("location_text", locationText);
             body.put("recorded_at", isoTime(System.currentTimeMillis()));

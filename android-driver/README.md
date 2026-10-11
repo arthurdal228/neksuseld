@@ -15,3 +15,14 @@ Build with the repository GitHub Actions workflow: `.github/workflows/android-ap
 - Cross-midnight status taps display the full continuous episode duration.
 - Break/Drive/Shift/Cycle use compact round ring indicators.
 - The driver app does not expose location Map/Copy controls.
+
+
+## v15 / Android 0.5.0
+
+- Automatic DR starts when effective GPS speed exceeds 3 mph. Effective speed uses both provider speed and coordinate-derived movement.
+- While DR, a stationary stop is kept as DR initially. After about 12 seconds the UI asks the driver to choose ON or OFF. If ignored for 60 seconds, the configured fallback is applied automatically.
+- Settings can choose ON Duty or Off Duty as the one-minute fallback.
+- Mobile UI uses softer rounded surfaces plus density and accent customization.
+- Seven daily log graphs keep website-style lanes and continuous cross-midnight episode durations.
+- Break/Drive/Shift/Cycle are circular HOS rings.
+- Alarm previews are Phone Ring, Rooster, Siren, and Alarm. The old short alarm set is removed.

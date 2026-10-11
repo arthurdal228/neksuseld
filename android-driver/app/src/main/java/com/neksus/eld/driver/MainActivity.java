@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
@@ -29,9 +30,11 @@ public class MainActivity extends Activity {
     public static final String PREF_LAST_SPEED = "last_speed_mps";
     public static final String PREF_LAST_LOCATION_TIME = "last_location_time";
     public static final String PREF_LAST_LOCATION_TEXT = "last_location_text";
+    public static final String PREF_AUTO_STOP_STATUS = "auto_stop_status";
     private static final int REQ_LOCATION = 1002;
     private static final int REQ_NOTIFICATIONS = 1001;
     private WebView webView;
+    private MediaPlayer previewPlayer;
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
@@ -180,6 +183,47 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void setAutoStopStatus(String status) {
+            String v = "OFF".equalsIgnoreCase(status) ? "OFF" : "ON";
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_AUTO_STOP_STATUS, v).apply();
+        }
+
+        @JavascriptInterface
+        public String getAutoStopStatus() {
+            String v = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_AUTO_STOP_STATUS, "ON");
+            return "OFF".equalsIgnoreCase(v) ? "OFF" : "ON";
+        }
+
+        @JavascriptInterface
+        public void previewAlarm(String name) {
+            runOnUiThread(() -> {
+                try {
+                    if (previewPlayer != null) {
+                        previewPlayer.stop();
+                        previewPlayer.release();
+                        previewPlayer = null;
+                    }
+                    int res;
+                    String key = name == null ? "phone_ring" : name.toLowerCase();
+                    switch (key) {
+                        case "rooster": res = R.raw.neksus_rooster; break;
+                        case "siren": res = R.raw.neksus_siren; break;
+                        case "alarm": res = R.raw.neksus_alarm; break;
+                        default: res = R.raw.neksus_phone_ring; break;
+                    }
+                    previewPlayer = MediaPlayer.create(MainActivity.this, res);
+                    if (previewPlayer != null) {
+                        previewPlayer.setOnCompletionListener(mp -> {
+                            mp.release();
+                            if (previewPlayer == mp) previewPlayer = null;
+                        });
+                        previewPlayer.start();
+                    }
+                } catch (Exception ignored) {}
+            });
+        }
+
+        @JavascriptInterface
         public void startDriveAnalyzer() {
             runOnUiThread(MainActivity.this::startDriveService);
         }
@@ -193,6 +237,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (previewPlayer != null) {
+            try { previewPlayer.stop(); } catch (Exception ignored) {}
+            previewPlayer.release();
+            previewPlayer = null;
+        }
         if (webView != null) webView.destroy();
         super.onDestroy();
     }

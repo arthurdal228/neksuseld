@@ -84,6 +84,7 @@ type DriverResponse struct {
 	LicenseNumber        string  `json:"license_number"`
 	HomeTerminalTimezone string  `json:"home_terminal_timezone"`
 	Truck                string  `json:"truck"`
+	VehicleID            string  `json:"vehicle_id"`
 	Trailer              string  `json:"trailer"`
 	BOL                  string  `json:"bol"`
 	VehicleType          string  `json:"vehicle_type"`
@@ -300,6 +301,7 @@ func main() {
 	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
 	mux.Handle("GET /v1/companies", s.readAuth(http.HandlerFunc(s.handleCompanies)))
 	mux.Handle("GET /v1/drivers", s.readAuth(http.HandlerFunc(s.handleDrivers)))
+	mux.Handle("GET /v1/vehicles", s.readAuth(http.HandlerFunc(s.handleVehicles)))
 	mux.Handle("GET /v1/alerts", s.readAuth(http.HandlerFunc(s.handleAlerts)))
 	mux.Handle("GET /v1/fleet/live", s.readAuth(http.HandlerFunc(s.handleFleetLive)))
 	mux.Handle("GET /v1/hos/current", s.readAuth(http.HandlerFunc(s.handleHOSBulk)))
@@ -310,6 +312,8 @@ func main() {
 	mux.Handle("GET /v1/admin/session", s.adminAuth(http.HandlerFunc(s.handleAdminSession)))
 	mux.Handle("POST /v1/admin/companies", s.adminAuth(http.HandlerFunc(s.handleAdminCompany)))
 	mux.Handle("POST /v1/admin/drivers", s.adminAuth(http.HandlerFunc(s.handleAdminDriver)))
+	mux.Handle("POST /v1/admin/vehicles", s.adminAuth(http.HandlerFunc(s.handleAdminVehicle)))
+	mux.Handle("DELETE /v1/admin/vehicles/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminVehicleDelete)))
 	mux.Handle("DELETE /v1/admin/drivers/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminDriverDelete)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/trip-info", s.adminAuth(http.HandlerFunc(s.handleAdminTripInfo)))
 	mux.Handle("PUT /v1/admin/drivers/{id}/live", s.adminAuth(http.HandlerFunc(s.handleAdminLive)))
@@ -533,7 +537,7 @@ func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, er
 	var statusSince, gpsRecordedAt *time.Time
 	err := s.db.QueryRow(ctx, `
 SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
-       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, COALESCE(d.vehicle_id::text,''), d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
        COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
@@ -544,7 +548,7 @@ LEFT JOIN companies c ON c.id=d.company_id
 LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
 WHERE d.id=$1 AND d.active=true`, id).Scan(
 		&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
-		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
+		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.VehicleID, &d.Trailer, &d.BOL,
 		&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
 		&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision,
 	)
@@ -565,7 +569,7 @@ func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.db.Query(r.Context(), `
 SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
-       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, d.trailer_number, d.shipping_document,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, COALESCE(d.vehicle_id::text,''), d.trailer_number, d.shipping_document,
        d.vehicle_type, d.certified,
        COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
        COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
@@ -587,7 +591,7 @@ LIMIT $1`, limit)
 		var d DriverResponse
 		var statusSince, gpsRecordedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
-			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.Trailer, &d.BOL,
+			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.VehicleID, &d.Trailer, &d.BOL,
 			&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
 			&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision); err != nil {
 			writeError(w, 500, err.Error())
@@ -1082,21 +1086,14 @@ func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if err := s.ensureDriverDayContinuity(r.Context(), id, date, timezone); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	segs, err := scanSegments(r.Context(), s.db, id, date)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
-	}
-	if len(segs) == 0 {
-		if err := s.repairCurrentLogIfEmpty(r.Context(), id, date, timezone); err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
-		segs, err = scanSegments(r.Context(), s.db, id, date)
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
 	}
 
 	segs = s.enrichSegmentEpisodes(r.Context(), id, date, timezone, segs)
@@ -1279,10 +1276,13 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "current device location is required for a status change")
 		return
 	}
-	// Do not let a manual status override an active automatic drive.
+	// A stopped driver may choose the post-drive status during the one-minute DR hold.
+	// While the truck is still moving, manual status changes remain blocked.
 	var activeCount int
-	if err := s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err == nil && activeCount > 0 {
-		writeError(w, http.StatusConflict, "Driving is active. Stop the vehicle before changing status manually")
+	var liveSpeed float64
+	_ = s.db.QueryRow(r.Context(), `SELECT COALESCE(gps_speed_mps,0) FROM driver_live_state WHERE driver_id=$1`, driverID).Scan(&liveSpeed)
+	if err := s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err == nil && activeCount > 0 && liveSpeed > autoDriveStopSpeedMPS {
+		writeError(w, http.StatusConflict, "Driving is active while the vehicle is moving")
 		return
 	}
 	if in.Note == "" {
@@ -1294,6 +1294,12 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if activeCount > 0 {
+		if _, err = s.finishActiveDriveSessionTx(r.Context(), tx, driverID, time.Now().UTC(), *in.Latitude, *in.Longitude, in.AccuracyMeters, liveSpeed, strings.TrimSpace(in.LocationText)); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
 	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, 0, in.AccuracyMeters, 0, time.Now().UTC(), false)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -1352,7 +1358,7 @@ ON CONFLICT(driver_id) DO UPDATE SET connected=true,location_text=EXCLUDED.locat
 
 func ringtoneAllowed(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "alert", "urgent", "chime", "bell", "pulse":
+	case "phone_ring", "rooster", "siren", "alarm":
 		return true
 	default:
 		return false
@@ -1429,7 +1435,7 @@ func (s *Server) handleAdminDriverAlarm(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if !ringtoneAllowed(in.Ringtone) {
-		writeError(w, 400, "ringtone must be alert, urgent, chime, bell or pulse")
+		writeError(w, 400, "ringtone must be phone_ring, rooster, siren or alarm")
 		return
 	}
 	var exists bool
@@ -1489,6 +1495,7 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 		LicenseIssueState string `json:"license_issue_state"`
 		LicenseNumber     string `json:"license_number"`
 		Vehicle           string `json:"vehicle"`
+		VehicleID         string `json:"vehicle_id"`
 		CompanyID         string `json:"company_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
@@ -1504,12 +1511,28 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	in.LicenseIssueState = strings.ToUpper(strings.TrimSpace(in.LicenseIssueState))
 	in.LicenseNumber = strings.TrimSpace(in.LicenseNumber)
 	in.Vehicle = strings.TrimSpace(in.Vehicle)
+	in.VehicleID = strings.TrimSpace(in.VehicleID)
 	in.CompanyID = strings.TrimSpace(in.CompanyID)
 	if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(in.CompanyID) {
 		writeError(w, http.StatusForbidden, "company is outside your access")
 		return
 	}
 	creating := in.ID == ""
+	if !creating {
+		var existingCompany string
+		if err := s.db.QueryRow(r.Context(), `SELECT COALESCE(company_id::text,'') FROM drivers WHERE id=$1 AND active=true`, in.ID).Scan(&existingCompany); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 404, "driver not found")
+			} else {
+				writeError(w, 500, err.Error())
+			}
+			return
+		}
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(existingCompany) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+	}
 	if !driverUsernamePattern.MatchString(in.Username) {
 		writeError(w, 400, "username must be 4-40 characters using letters, numbers, dot, underscore or dash")
 		return
@@ -1570,6 +1593,38 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	vehicleID := ""
+	vehicleUnit := ""
+	vehicleType := "TRACTOR"
+	if in.VehicleID != "" || in.Vehicle != "" {
+		query := `SELECT id::text,unit_number,vehicle_type FROM vehicles WHERE active=true AND company_id=$1::uuid AND `
+		args := []any{companyID}
+		if in.VehicleID != "" {
+			query += `id=$2::uuid`
+			args = append(args, in.VehicleID)
+		} else {
+			query += `unit_number=$2`
+			args = append(args, in.Vehicle)
+		}
+		if err := s.db.QueryRow(r.Context(), query, args...).Scan(&vehicleID, &vehicleUnit, &vehicleType); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 400, "selected vehicle does not belong to this company")
+			} else {
+				writeError(w, 500, err.Error())
+			}
+			return
+		}
+		var assignedTo string
+		err := s.db.QueryRow(r.Context(), `SELECT id FROM drivers WHERE vehicle_id=$1::uuid AND active=true AND id<>$2 LIMIT 1`, vehicleID, in.ID).Scan(&assignedTo)
+		if err == nil {
+			writeError(w, 409, "vehicle is already assigned to another driver")
+			return
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -1577,14 +1632,14 @@ func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	_, err = tx.Exec(r.Context(), `
-INSERT INTO drivers(id,username,first_name,last_name,full_name,password_hash,license_issue_state,license_number,company_id,carrier,phone,email,truck_unit,active)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,true)
+INSERT INTO drivers(id,username,first_name,last_name,full_name,password_hash,license_issue_state,license_number,company_id,carrier,phone,email,truck_unit,vehicle_id,vehicle_type,active)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,NULLIF($14,'')::uuid,$15,true)
 ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
  full_name=EXCLUDED.full_name, password_hash=CASE WHEN EXCLUDED.password_hash<>'' THEN EXCLUDED.password_hash ELSE drivers.password_hash END,
  license_issue_state=EXCLUDED.license_issue_state, license_number=EXCLUDED.license_number,
  company_id=EXCLUDED.company_id, carrier=EXCLUDED.carrier, phone=EXCLUDED.phone, email=EXCLUDED.email,
- truck_unit=EXCLUDED.truck_unit, active=true`, in.ID, in.Username, in.FirstName, in.LastName, fullName, passwordHash,
-		in.LicenseIssueState, in.LicenseNumber, companyID, carrier, in.Phone, in.Email, in.Vehicle)
+ truck_unit=EXCLUDED.truck_unit, vehicle_id=EXCLUDED.vehicle_id, vehicle_type=EXCLUDED.vehicle_type, active=true`, in.ID, in.Username, in.FirstName, in.LastName, fullName, passwordHash,
+		in.LicenseIssueState, in.LicenseNumber, companyID, carrier, in.Phone, in.Email, vehicleUnit, vehicleID, vehicleType)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -1707,13 +1762,25 @@ func (s *Server) handleAdminDriverDelete(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "driver id is required")
 		return
 	}
-	ct, err := s.db.Exec(r.Context(), `DELETE FROM drivers WHERE id=$1`, id)
+	tx, err := s.db.Begin(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	ct, err := tx.Exec(r.Context(), `UPDATE drivers SET active=false,vehicle_id=NULL,truck_unit='',updated_at=now() WHERE id=$1 AND active=true`, id)
+	if err != nil {
+		writeError(w, 500, err.Error())
 		return
 	}
 	if ct.RowsAffected() == 0 {
-		writeError(w, http.StatusNotFound, "driver not found")
+		writeError(w, 404, "driver not found")
+		return
+	}
+	_, _ = tx.Exec(r.Context(), `DELETE FROM driver_sessions WHERE driver_id=$1`, id)
+	_, _ = tx.Exec(r.Context(), `UPDATE driver_live_state SET connected=false,revision=revision+1 WHERE driver_id=$1`, id)
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1739,9 +1806,33 @@ func (s *Server) handleAdminLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Truck != nil {
-		if _, err := s.db.Exec(r.Context(), `UPDATE drivers SET truck_unit=$2 WHERE id=$1`, id, strings.TrimSpace(*in.Truck)); err != nil {
-			writeError(w, 500, err.Error())
-			return
+		unit := strings.TrimSpace(*in.Truck)
+		if unit == "" {
+			if _, err := s.db.Exec(r.Context(), `UPDATE drivers SET truck_unit='',vehicle_id=NULL,updated_at=now() WHERE id=$1`, id); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		} else {
+			var vehicleID, vehicleType string
+			err := s.db.QueryRow(r.Context(), `SELECT v.id::text,v.vehicle_type FROM vehicles v JOIN drivers d ON d.company_id=v.company_id WHERE d.id=$1 AND d.active=true AND v.active=true AND v.unit_number=$2`, id, unit).Scan(&vehicleID, &vehicleType)
+			if err != nil {
+				writeError(w, 400, "vehicle must belong to the driver's company")
+				return
+			}
+			var other string
+			err = s.db.QueryRow(r.Context(), `SELECT id FROM drivers WHERE vehicle_id=$1::uuid AND active=true AND id<>$2 LIMIT 1`, vehicleID, id).Scan(&other)
+			if err == nil {
+				writeError(w, 409, "vehicle is already assigned to another driver")
+				return
+			}
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 500, err.Error())
+				return
+			}
+			if _, err := s.db.Exec(r.Context(), `UPDATE drivers SET truck_unit=$2,vehicle_id=$3::uuid,vehicle_type=$4,updated_at=now() WHERE id=$1`, id, unit, vehicleID, vehicleType); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
 		}
 	}
 	current, err := s.queryLiveState(r.Context(), id)

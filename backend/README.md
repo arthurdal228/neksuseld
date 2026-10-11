@@ -241,7 +241,7 @@ Content-Type: application/json
 }
 ```
 
-Supported ringtones: `alert`, `urgent`, `chime`, `bell`, `pulse`.
+Supported ringtones: `phone_ring`, `rooster`, `siren`, `alarm`.
 
 Driver-app delivery endpoints:
 
@@ -256,7 +256,7 @@ Create carriers separately through `POST /v1/admin/companies` with `name` and `u
 
 ## Driver alarms
 
-`POST /v1/admin/drivers/:id/alarms` accepts `alert`, `urgent`, `chime`, `bell`, or `pulse`. Signed-in Android drivers receive pending alarms through the driver alarm service.
+`POST /v1/admin/drivers/:id/alarms` accepts `phone_ring`, `rooster`, `siren`, or `alarm`. Signed-in Android drivers receive pending alarms through the driver alarm service.
 
 ## v8: server-backed multi-day log editing
 
@@ -340,3 +340,15 @@ CONTROL_ADMIN_NAME=NEKSUS Super Admin
 On startup, the backend creates/refreshes that account as `super_admin` with access to all companies. Use the separate `control/` frontend to create operator/manager/viewer accounts and assign companies.
 
 Company scoping is enforced in the backend for company/driver lists, bulk HOS, live fleet data, alerts, driver-specific log/HOS routes, and driver-specific admin write routes. The original `ADMIN_TOKEN` remains available only as a maintenance/backward-compatibility path during migration.
+
+
+## v15 company fleet + continuity + mobile stop flow
+
+- `vehicles` is now a first-class company-owned table.
+- `GET /v1/vehicles`, `POST /v1/admin/vehicles`, and `DELETE /v1/admin/vehicles/{id}` manage the vehicle roster.
+- Driver vehicle assignment is rejected unless the active vehicle belongs to the same company and is not assigned to another active driver.
+- Driver and vehicle Remove actions archive records instead of destroying historical logs.
+- `ensureDriverDayContinuity` materializes requested missing log days server-side. Historical open fragments are closed at midnight while today's fragment remains open through current home-terminal time.
+- Android auto Driving starts at >3 mph and auto stop confirmation occurs after 60 seconds stationary. Manual stopped DR can transition to ON/OFF through `/v1/driver/status`.
+- The driver telemetry payload carries the selected automatic stop fallback (`ON` or `OFF`).
+- Alarm ringtones are now only `phone_ring`, `rooster`, `siren`, and `alarm`; legacy stored values migrate to `phone_ring`.
