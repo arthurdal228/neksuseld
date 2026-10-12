@@ -940,6 +940,54 @@ html[data-theme="dark"] .nav a.active{color:var(--green2);background:#87caa216;b
 @media(max-width:1120px){.stack-driver-compact .stack-driver-main{grid-template-columns:minmax(160px,1fr) auto}.stack-driver-quick{grid-column:1/-1;display:flex;flex-direction:row;justify-content:space-between;gap:10px}.stack-driver-top-actions{order:3;margin:0}.stack-driver-quick .stack-trip-btn{width:auto}.stack-driver-compact .stack-hos-mini{justify-content:flex-end}.topbar .breadcrumb{display:none}.topbar .global-search{margin-right:auto}}
 @media(max-width:760px){.topbar .global-search{display:flex}.stack-driver-compact .stack-driver-main{grid-template-columns:minmax(0,1fr);padding:12px}.stack-driver-compact .stack-hos-mini{justify-content:flex-start;flex-wrap:wrap}.stack-driver-quick{grid-column:auto;flex-wrap:wrap}.stack-driver-quick .stack-trip-btn{flex:0 1 auto}.topbar .global-search{width:auto;flex:1;min-width:80px}.topbar .global-search .key{display:none}.topbar .company-search{max-width:125px}.topbar{padding:0 10px;gap:7px}.stack-driver-utility{padding:6px 11px}}
 @media(max-width:600px){body.nav-compact,body.nav-expanded{--sidebar:0px!important}.topbar{gap:5px;padding:0 9px}.topbar .global-search{display:flex;flex:1 1 auto;min-width:96px;width:auto;padding:7px}.topbar .global-search input{font-size:10px}.topbar .company-search{max-width:108px;min-width:0;flex:0 1 108px}.topbar .company-search input{font-size:9px}.topbar>.help-btn{display:none}}
+
+/* v16.1: centered HOS clocks, a single-row driver header, and compact quick tools. */
+.stack-driver-compact{margin-bottom:8px}
+.stack-driver-compact .stack-driver-main{grid-template-columns:minmax(0,1fr) max-content minmax(0,1fr);column-gap:10px;row-gap:7px;min-height:80px;padding:9px 12px}
+.stack-driver-compact .stack-driver-identity{grid-column:1;grid-row:1;justify-self:start}
+.stack-driver-compact .stack-hos-mini{grid-column:2;grid-row:1;justify-self:center;justify-content:center;order:unset;width:auto;gap:8px;margin:0}
+.stack-driver-compact .stack-hos-item{height:54px;width:54px;flex:0 0 54px}
+.stack-driver-compact .stack-hos-item:after{inset:4px}
+.stack-driver-compact .stack-hos-time{font-size:10px}
+.stack-driver-compact .stack-hos-item small{font-size:7px}
+.stack-driver-compact .stack-driver-quick{grid-column:3;grid-row:1;justify-self:end;display:flex;flex-direction:column;max-width:225px;gap:1px;margin:0}
+.stack-driver-compact .stack-driver-top-actions{display:flex;gap:4px;align-items:center;margin-bottom:2px;justify-content:flex-end;order:unset}
+.stack-driver-compact .stack-driver-top-actions .btn{height:23px;min-height:23px;padding:2px 7px;font-size:9px}
+.stack-driver-compact .stack-driver-top-actions>.icon-btn{width:23px;height:23px;border-radius:6px}
+.stack-driver-compact .stack-driver-quick .stack-trip-btn{height:18px;width:100%;justify-content:flex-end}
+.stack-driver-compact .stack-driver-subline{margin-top:3px}
+/* Compact right-click panel, while still showing the map on initial open. */
+#neksus-status-context{width:min(260px,calc(100vw - 18px));padding:7px;border-radius:11px;max-height:calc(100dvh - 14px);font-size:10px;box-shadow:0 12px 36px #0009}
+#neksus-status-context .ctx-head{padding:2px 3px 6px;gap:4px}
+#neksus-status-context .ctx-head strong{font-size:11px}
+#neksus-status-context .ctx-kicker{font-size:8px}
+#neksus-status-context .ctx-range{font-size:9px;margin-top:2px}
+#neksus-status-context .ctx-close{width:22px;height:22px}
+#neksus-status-context .ctx-status-grid{gap:3px;margin:7px 0 6px}
+#neksus-status-context .ctx-status{font-size:9px;padding:6px 1px;border-radius:5px;min-height:28px}
+#neksus-status-context .ctx-option{font-size:10px;padding:6px 5px;min-height:29px;gap:7px}
+#neksus-status-context .ctx-expand{padding:6px;margin:3px 0 5px}
+#neksus-status-context .ctx-map-frame{height:114px;border-radius:7px}
+#neksus-status-context .ctx-loc-name{font-size:9px}
+#neksus-status-context .ctx-bottom{padding-top:4px;margin-top:4px}
+#neksus-status-context .ctx-expand .btn{margin-top:6px;padding:7px}
+#neksus-status-context .ctx-working{opacity:.65;pointer-events:none}#neksus-status-context .ctx-map-section{background:#111a1f;border:1px solid #344448;border-radius:8px;padding:5px;margin:4px 0 5px}
+@media(max-width:1080px){
+ .stack-driver-compact .stack-driver-main{grid-template-columns:minmax(0,1fr) max-content;gap:8px 12px}
+ .stack-driver-compact .stack-driver-identity{grid-column:1;grid-row:1}
+ .stack-driver-compact .stack-hos-mini{grid-column:2;grid-row:1;justify-self:center;width:auto;margin:0;order:unset}
+ .stack-driver-compact .stack-driver-quick{grid-column:1/-1;grid-row:2;display:flex;flex-direction:row;justify-content:flex-end;max-width:none;width:100%;flex-wrap:wrap;align-items:center;gap:8px}
+ .stack-driver-compact .stack-driver-top-actions{order:unset}
+ .stack-driver-compact .stack-driver-quick .stack-trip-btn{width:auto}
+}
+@media(max-width:710px){
+ .stack-driver-compact .stack-driver-main{grid-template-columns:minmax(0,1fr);padding:9px;gap:8px}
+ .stack-driver-compact .stack-driver-identity{grid-column:1;grid-row:1;width:100%}
+ .stack-driver-compact .stack-hos-mini{grid-column:1;grid-row:2;justify-self:center;justify-content:center;flex-wrap:nowrap;gap:7px;width:100%}
+ .stack-driver-compact .stack-driver-quick{grid-column:1;grid-row:3;justify-self:stretch;justify-content:space-between;gap:5px}
+ .stack-driver-compact .stack-driver-top-actions{margin:0}
+ .stack-driver-compact .stack-trip-btn span{display:none}
+}
 </style>
 <script id="neksus-v9-log-editor-js">
 (()=>{
@@ -996,12 +1044,12 @@ function stackDriverHeader(d){
   </div>
   ${stackMiniHos(d,current)}
   <div class="stack-driver-quick">
-   <div class="stack-driver-top-actions"><button class="btn small" data-action="send-driver-alarm" data-id="${esc(d.id)}" title="Send driver alarm">${icon('bell')} Alarm</button><button class="icon-btn" data-action="export-log" data-id="${esc(d.id)}" title="Export log" aria-label="Export log">${icon('download')}</button></div>
+   <div class="stack-driver-top-actions"><button class="btn small ${stackSwapState.active?'primary':''}" data-action="stack-swap" title="Swap status time">${icon('refresh')} ${stackSwapState.active?`Swap ${stackSwapState.selected.length}/2`:'Swap'}</button><button class="icon-btn ${stackSwapState.active?'':'hidden'}" data-action="stack-swap-cancel" title="Cancel Swap" aria-label="Cancel Swap mode">${icon('close')}</button><button class="btn small" data-action="send-driver-alarm" data-id="${esc(d.id)}" title="Send driver alarm">${icon('bell')} Alarm</button><button class="icon-btn" data-action="export-log" data-id="${esc(d.id)}" title="Export log" aria-label="Export log">${icon('download')}</button></div>
    <button class="stack-trip-btn" data-action="driver-trip-info" data-id="${esc(d.id)}" title="Edit trailer"><span>Trailer</span><b>${esc(d.trailer||'—')}</b>${icon('edit')}</button>
    <button class="stack-trip-btn" data-action="driver-trip-info" data-id="${esc(d.id)}" title="Edit shipping documents"><span>Shipping docs</span><b>${esc(d.bol||'—')}</b>${icon('edit')}</button>
   </div>
  </div>
- <div class="stack-driver-utility"><select class="select stack-driver-select" id="log-driver-select" aria-label="Select driver">${db.drivers.map(x=>`<option value="${esc(x.id)}" ${x.id===d.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select><div class="stack-toolbar"><button class="btn small ${stackSwapState.active?'primary':''}" data-action="stack-swap" title="Swap status time">${icon('refresh')} ${stackSwapState.active?`Swap ${stackSwapState.selected.length}/2`:'Swap'}</button><button class="icon-btn ${stackSwapState.active?'':'hidden'}" data-action="stack-swap-cancel" title="Cancel Swap mode" aria-label="Cancel Swap mode">${icon('close')}</button></div></div>
+
  </section>`;
 }
 renderLogs=function(){if(!db.drivers.length)return pageHeading('Driver logs','','','')+`<section class="panel"><div style="padding:34px">${emptyHTML('No online drivers','Open Settings to connect the backend.','settings','Open Settings')}</div></section>`;const d=driverById(state.driverId)||db.drivers[0];state.driverId=d.id;const current=driverCurrentDate(d);state.date=current;const dates=stackDates(d);scheduleStackLogs(d,dates);return stackDriverHeader(d)+`<div class="stack-log-list">${dates.map((date,i)=>stackDayHTML(d,date,i)).join('')}</div>${stackDays<30?`<div class="stack-load-more"><button class="btn" data-action="stack-load-older">${icon('plus')} Older days</button></div>`:''}`;};
@@ -1070,17 +1118,16 @@ function stackContextRender(){const st=stackContextState;if(!st)return;
  let menu=document.getElementById('neksus-status-context');if(!menu){menu=document.createElement('div');menu.id='neksus-status-context';menu.setAttribute('role','dialog');menu.setAttribute('aria-label','Duty status quick tools');document.body.appendChild(menu)}
  const {seg,date}=st,label=stackStatusLabel(seg),duration=stackHMS(stackDisplayDurationSecond(seg));
  const items=['OFF','SB','DR','ON','PC','YM'],canEdit=String(CURRENT_WEB_USER?.role||'operator').toLowerCase()!=='viewer';
- const mapPanel=st.panel==='map';const aiPanel=st.panel==='ai';
+ const aiPanel=st.panel==='ai';
  let embedded='';
  if(st.hasCoords){const lat=st.lat,lon=st.lon,bbox=[lon-.012,lat-.008,lon+.012,lat+.008].map(n=>n.toFixed(6)).join(',');
   embedded=`<div class="ctx-map-frame"><iframe title="Selected duty location" loading="lazy" referrerpolicy="no-referrer" src="https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bbox)}&amp;layer=mapnik&amp;marker=${encodeURIComponent(lat.toFixed(6)+','+lon.toFixed(6))}"></iframe></div>`;
- }else embedded=`<div class="ctx-map-frame"><div class="ctx-map-empty">${esc(st.loc||'Location unavailable')}</div></div>`;
+ }else if(st.loc&&st.loc!=='Location unavailable')embedded=`<div class="ctx-map-frame"><iframe title="Selected duty location" loading="lazy" referrerpolicy="no-referrer" src="https://maps.google.com/maps?q=${encodeURIComponent(st.loc)}&amp;z=12&amp;output=embed"></iframe></div>`;else embedded=`<div class="ctx-map-frame"><div class="ctx-map-empty">Location unavailable</div></div>`;
  const candidate=st.candidate;
  menu.innerHTML=`<div class="ctx-head"><div><span class="ctx-kicker">${esc(date)} · ${esc(label)}</span><strong>${esc(duration)}</strong><span class="ctx-range">${esc(stackClockSecond(stackSecond(seg,'start')))} → ${esc(stackClockSecond(stackSecond(seg,'end')))}</span></div><button class="ctx-close" type="button" data-ctx-action="close" title="Close" aria-label="Close quick tools">${icon('close')}</button></div>
- ${canEdit?`<div class="ctx-status-grid" role="group" aria-label="Change duty status">${items.map(k=>`<button type="button" class="ctx-status" data-status="${k}" data-ctx-action="status" title="Edit to ${esc(k)}">${k}</button>`).join('')}</div>`:''}
- ${canEdit?`<button class="ctx-option" data-ctx-action="notes" type="button">${icon('edit')} Add notes <span class="ctx-arrow">›</span></button><button class="ctx-option" data-ctx-action="ai" type="button" aria-expanded="${aiPanel}">${icon('activity')} AI Actions <span class="ctx-arrow">${aiPanel?'⌄':'›'}</span></button><div class="ctx-expand" ${aiPanel?'':'hidden'}>${candidate?`<button class="ctx-option" data-ctx-action="pti" type="button">${icon('checkCircle')} Auto PTI</button>`:''}<div data-ctx-pti-panel hidden></div></div>`:''}
- <button class="ctx-option" data-ctx-action="map" type="button" aria-expanded="${mapPanel}">${icon('location')} Map <span class="ctx-arrow">${mapPanel?'⌄':'›'}</span></button>
- <div class="ctx-expand" ${mapPanel?'':'hidden'}>${embedded}<div class="ctx-bottom"><span class="ctx-loc-name">${esc(st.loc||'Location unavailable')}</span><button class="ctx-option" type="button" data-ctx-action="openmap">${icon('external')} Open in Google Maps</button></div></div>`;
+ ${canEdit?`<div class="ctx-status-grid" role="group" aria-label="Change duty status">${items.map(k=>`<button type="button" class="ctx-status" data-status="${k}" data-ctx-action="status" title="Save ${esc(k)} immediately">${k}</button>`).join('')}</div>`:''}
+ ${canEdit?`<button class="ctx-option" data-ctx-action="notes" type="button">${icon('edit')} Add notes <span class="ctx-arrow">›</span></button><button class="ctx-option" data-ctx-action="ai" type="button" aria-expanded="${aiPanel}">${icon('activity')} AI Actions <span class="ctx-arrow">${aiPanel?'⌄':'›'}</span></button><div class="ctx-expand" ${aiPanel?'':'hidden'}>${candidate?`<button class="ctx-option" data-ctx-action="pti" type="button">${icon('checkCircle')} Auto PTI</button>`:''}</div>`:''}
+ <div class="ctx-map-section">${embedded}<div class="ctx-bottom"><span class="ctx-loc-name">${esc(st.loc||'Location unavailable')}</span><button class="ctx-option" type="button" data-ctx-action="openmap">${icon('external')} Open in Google Maps</button></div></div>`;
  const w=menu.offsetWidth,h=menu.offsetHeight;
  menu.style.left=Math.max(8,Math.min(st.x,window.innerWidth-w-8))+'px';
  menu.style.top=Math.max(8,Math.min(st.y,window.innerHeight-h-8))+'px';
@@ -1089,26 +1136,60 @@ function stackContextOpen(hit,e){const svg=hit.closest('.stack-log-svg');if(!svg
  const d=driverById(svg.dataset.driver),date=svg.dataset.date,index=Number(hit.dataset.stackSeg);if(!d||!Number.isInteger(index))return;
  if(stackSwapState.active)stackCancelSwap();
  stackContextClose();const data=stackContextRecord(d,date,index);if(!data)return;
- stackContextState={...data,panel:'',x:e.clientX,y:e.clientY};stackContextRender();
+ stackContextState={...data,panel:'',saving:false,openedAt:Date.now(),x:e.clientX,y:e.clientY};stackContextRender();
  svg.closest('.stack-graph-wrap')?.querySelector('.stack-duration-tooltip')?.setAttribute('hidden','');
 }
-function stackContextQuickEdit(code){const st=stackContextState;if(!st)return;
- const d=st.d,date=st.date,seg=st.seg,index=st.index;
- const preset={OFF:'Off duty',SB:'Sleeper berth',DR:'',ON:'',PC:'',YM:''};
- stackContextClose();stackSetSelection(d,date,{start:seg.start,end:seg.end,segmentIndex:index,pick:code,contextNote:preset[code]??''});
- requestAnimationFrame(()=>{const form=document.querySelector(`.stack-day[data-date="${date}"] form[data-form="stack-range-edit"]`);form?.scrollIntoView({block:'nearest',behavior:'smooth'});if(code==='ON'||code==='DR'||code==='PC'||code==='YM')form?.querySelector('[name="note"]')?.focus({preventScroll:true})});
+async function stackContextQuickEdit(code){
+ const st=stackContextState;
+ if(!st||st.saving)return;
+ const {d,date,seg}=st;
+ const original=stackStatusLabel(seg);
+ if(!['OFF','SB','DR','ON','PC','YM'].includes(code))return;
+ if(original===code){stackContextClose();return}
+ if(String(CURRENT_WEB_USER?.role||'operator').toLowerCase()==='viewer')return;
+ // Quick edits change the selected existing span. The backend rebuilds overlapping
+ // projections and keeps the original event/audit history available for Undo.
+ const start=Number(seg.start),end=Number(seg.end),dayEnd=stackDayEnd(d,date);
+ if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||end>dayEnd){
+  toast('Select a valid duty period before changing its status.',true);return;
+ }
+ st.saving=true;
+ const menu=document.getElementById('neksus-status-context');
+ if(menu){menu.classList.add('ctx-working');menu.querySelectorAll('button').forEach(b=>b.disabled=true)}
+ const labels={OFF:'OFF duty',SB:'Sleeper berth',DR:'Driving',ON:'ON duty',PC:'Personal conveyance',YM:'Yard move'};
+ // Do not carry an old PTI/delivery note onto an unrelated status.
+ const annotation=`Admin quick correction: ${labels[code]||code}`;
+ try{
+  const ok=await stackApplyRange(d.id,date,{
+   start_minute:start,end_minute:end,status:code,note:annotation,
+   operator:currentOperatorName(),location_text:seg.location||d.liveLocation||'',
+   odometer_miles:Number(seg.odoStart||0),engine_hours:Number(seg.engineHours||0),
+   trailer_number:seg.trailer||d.trailer||'',shipping_document:seg.bol||d.bol||''
+  });
+  if(ok){stackContextClose();stackDiscardDraft();render();toast(`${labels[code]} saved.`)}
+  else{st.saving=false;stackContextRender()}
+ }catch(err){st.saving=false;stackContextRender();toast('Quick status change failed: '+err.message,true)}
 }
 function stackContextOpenNotes(){const st=stackContextState;if(!st)return;const{d,date,seg,index}=st;stackContextClose();stackSetSelection(d,date,{start:seg.start,end:seg.end,segmentIndex:index,pick:stackStatusLabel(seg)});requestAnimationFrame(()=>{const form=document.querySelector(`.stack-day[data-date="${date}"] form[data-form="stack-range-edit"]`);form?.scrollIntoView({block:'nearest',behavior:'smooth'});form?.querySelector('[name="note"]')?.focus({preventScroll:true})})}
-function stackContextShowPTI(){const st=stackContextState,range=st?.candidate;
- if(!range)return;const panel=document.querySelector('#neksus-status-context [data-ctx-pti-panel]');if(!panel)return;
- panel.hidden=false;panel.innerHTML=`<div class="ctx-range">${esc(time12(range.start))} → ${esc(time12(range.end))} · 00:15</div><label><input type="checkbox" data-ctx-verified> PTI completed</label><button class="btn primary" data-ctx-action="apply-pti" type="button" disabled>Apply PTI</button>`;
-}
-async function stackContextApplyPTI(button){const st=stackContextState,range=st?.candidate;
- if(!range||!document.querySelector('#neksus-status-context [data-ctx-verified]')?.checked)return;
- button.disabled=true;
- try{const seg=st.seg,ok=await stackApplyRange(st.d.id,st.date,{start_minute:range.start,end_minute:range.end,status:'ON',note:'PTI',reason:'Verified PTI',operator:currentOperatorName(),location_text:seg.location||'',odometer_miles:Number(seg.odoStart||0),engine_hours:Number(seg.engineHours||0),trailer_number:seg.trailer||st.d.trailer||'',shipping_document:seg.bol||st.d.bol||''});
-  if(ok){stackContextClose();render();toast('PTI saved.')}else button.disabled=false;
- }catch(err){button.disabled=false;toast('PTI could not be saved: '+err.message,true)}
+async function stackContextApplyPTI(button){
+ const st=stackContextState,range=st?.candidate;
+ if(!st||!range||st.saving)return;
+ const before=`${time12(range.start)}–${time12(range.end)}`;
+ // Rest time does not prove an inspection took place. The person recording it
+ // must confirm the actual PTI. One confirmation replaces checkbox + Apply.
+ if(!window.confirm(`Record a completed 15-minute PTI (${before}) for ${st.d.name}? Confirm only if the inspection actually occurred.`))return;
+ st.saving=true;button.disabled=true;
+ try{
+  const seg=st.seg;
+  const ok=await stackApplyRange(st.d.id,st.date,{
+   start_minute:range.start,end_minute:range.end,status:'ON',note:'PTI',
+   operator:currentOperatorName(),location_text:seg.location||'',
+   odometer_miles:Number(seg.odoStart||0),engine_hours:Number(seg.engineHours||0),
+   trailer_number:seg.trailer||st.d.trailer||'',shipping_document:seg.bol||st.d.bol||''
+  });
+  if(ok){stackContextClose();stackDiscardDraft();render();toast('Completed PTI recorded.')}
+  else{st.saving=false;stackContextRender()}
+ }catch(err){st.saving=false;stackContextRender();toast('PTI could not be saved: '+err.message,true)}
 }
 document.addEventListener('contextmenu',e=>{const hit=e.target.closest?.('.stack-segment-hit');if(!hit)return;e.preventDefault();e.stopPropagation();stackContextOpen(hit,e)},true);
 document.addEventListener('click',e=>{const button=e.target.closest?.('[data-ctx-action]');if(!button)return;
@@ -1116,15 +1197,13 @@ document.addEventListener('click',e=>{const button=e.target.closest?.('[data-ctx
  if(action==='close'){stackContextClose();return}
  if(action==='status'){stackContextQuickEdit(button.dataset.status);return}
  if(action==='notes'){stackContextOpenNotes();return}
- if(action==='map'||action==='ai'){st.panel=st.panel===action?'':action;stackContextRender();return}
+ if(action==='ai'){st.panel=st.panel==='ai'?'':'ai';stackContextRender();return}
  if(action==='openmap'){stackOpenGoogleMap(st.hasCoords?st.lat:NaN,st.hasCoords?st.lon:NaN,st.loc);return}
- if(action==='pti'){stackContextShowPTI();return}
- if(action==='apply-pti'){stackContextApplyPTI(button);return}
+ if(action==='pti'){stackContextApplyPTI(button);return}
 },true);
-document.addEventListener('change',e=>{if(e.target?.matches?.('[data-ctx-verified]')){const btn=document.querySelector('#neksus-status-context [data-ctx-action="apply-pti"]');if(btn)btn.disabled=!e.target.checked}},true);
-document.addEventListener('pointerdown',e=>{if(stackContextState&&!e.target.closest?.('#neksus-status-context'))stackContextClose()},true);
+document.addEventListener('pointerdown',e=>{if(stackContextState&&!stackContextState.saving&&!e.target.closest?.('#neksus-status-context'))stackContextClose()},true);
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&stackContextState){e.preventDefault();e.stopImmediatePropagation();stackContextClose()}},true);
-window.addEventListener('scroll',e=>{if(stackContextState&&!e.target?.closest?.('#neksus-status-context'))stackContextClose()},true);
+window.addEventListener('scroll',e=>{if(stackContextState&&!stackContextState.saving&&Date.now()-stackContextState.openedAt>250&&!e.target?.closest?.('#neksus-status-context'))stackContextClose()},true);
 window.addEventListener('blur',()=>{if(stackContextState)stackContextClose()});
 function stackOpenTripInfo(d){showModal('Trip information',`<form data-form="stack-trip-info" data-driver="${esc(d.id)}"><div class="form-grid"><div class="form-group"><label>Trailer</label><input name="trailer" maxlength="40" value="${esc(d.trailer||'')}"></div><div class="form-group"><label>Shipping document</label><input name="bol" maxlength="80" value="${esc(d.bol||'')}"></div></div><div class="modal-footer"><button type="button" class="btn" data-action="close-dialog">Cancel</button><button type="submit" class="btn primary">Save</button></div></form>`,'',true);}
 document.addEventListener('pointermove',e=>{const hit=e.target.closest?.('.stack-segment-hit');if(!hit)return;const wrap=hit.closest('.stack-graph-wrap'),tip=wrap?.querySelector('.stack-duration-tooltip');if(!wrap||!tip)return;const r=wrap.getBoundingClientRect();tip.innerHTML=`<b>${esc(hit.dataset.stackLabel||'Status')}</b><span>${esc(hit.dataset.stackEpisode||hit.dataset.stackTime||'')}</span><span class="mono">${esc(hit.dataset.stackDuration||'')}</span>`;tip.style.left=Math.max(78,Math.min(r.width-78,e.clientX-r.left))+'px';tip.hidden=false;});
