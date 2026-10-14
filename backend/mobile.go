@@ -17,19 +17,23 @@ import (
 const (
 	autoDriveStartSpeedMPS = 1.34112 // 3 mph
 	autoDriveStopSpeedMPS  = 0.44704 // treat sub-1 mph GPS jitter as stopped
-	autoDriveStartSamples  = 1
+	autoDriveStartSamples  = 3
 	autoDriveStopHold      = 60 * time.Second
 )
 
 type telemetryInput struct {
-	Latitude       float64 `json:"latitude"`
-	Longitude      float64 `json:"longitude"`
-	AccuracyMeters float64 `json:"accuracy_meters"`
-	SpeedMPS       float64 `json:"speed_mps"`
-	OdometerMiles  float64 `json:"odometer_miles"`
-	LocationText   string  `json:"location_text"`
-	RecordedAt     string  `json:"recorded_at"`
-	AutoStopStatus string  `json:"auto_stop_status"`
+	Latitude        float64 `json:"latitude"`
+	Longitude       float64 `json:"longitude"`
+	AccuracyMeters  float64 `json:"accuracy_meters"`
+	SpeedMPS        float64 `json:"speed_mps"`
+	OdometerMiles   float64 `json:"odometer_miles"`
+	LocationText    string  `json:"location_text"`
+	RecordedAt      string  `json:"recorded_at"`
+	AutoStopStatus  string  `json:"auto_stop_status"`
+	AutoStopSeconds *int    `json:"auto_stop_seconds"`
+	ClientEventID   string  `json:"client_event_id"`
+	MotionVersion   int     `json:"motion_version"`
+	SpeedValid      *bool   `json:"speed_valid"`
 }
 
 func validCoordinates(lat, lon float64) bool {
@@ -53,8 +57,14 @@ func localDriverMoment(ctx context.Context, q interface {
 }
 
 func (s *Server) transitionDriverStatusTx(ctx context.Context, tx pgx.Tx, driverID, status, note, origin, locationText string, lat, lon, odometer, accuracy, speed float64, at time.Time, automatic bool) (string, int, int, bool, error) {
-	logDate, minute, second, _, err := localDriverMoment(ctx, tx, driverID, at)
+	logDate, minute, second, tz, err := localDriverMoment(ctx, tx, driverID, at)
 	if err != nil {
+		return "", 0, 0, false, err
+	}
+	if err = lockDriver(ctx, tx, driverID); err != nil {
+		return "", 0, 0, false, err
+	}
+	if err = s.continuousDayTx(ctx, tx, driverID, logDate, tz); err != nil {
 		return "", 0, 0, false, err
 	}
 	currentStatus := "OFF"
@@ -87,30 +97,43 @@ ON CONFLICT(driver_id) DO UPDATE SET
 		return "", 0, 0, false, err
 	}
 
-	var openID, openStatus string
-	var openStartMinute, openStartSecond int
-	err = tx.QueryRow(ctx, `
-SELECT id::text,duty_status,start_minute,COALESCE(start_second,start_minute*60)
-FROM duty_segments
-WHERE driver_id=$1 AND log_date=$2 AND end_minute IS NULL
-ORDER BY start_minute DESC, created_at DESC
-LIMIT 1 FOR UPDATE`, driverID, logDate).Scan(&openID, &openStatus, &openStartMinute, &openStartSecond)
-	hadOpen := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	before, err := s.scanSegmentsTx(ctx, tx, driverID, logDate)
+	if err != nil {
 		return "", 0, 0, false, err
 	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin,location_text,odometer_miles) VALUES($1,$2,$3,$4,NULL,NULL,$5,$6,$7,$8,$9)`, driverID, logDate, minute, second, status, note, origin, locationText, odometer)
-	} else if openStatus != status {
-		if second < openStartSecond {
-			second = openStartSecond
-			minute = second / 60
+	hadOpen := len(before) > 0
+	if changed || !hadOpen {
+		after := []SegmentResponse{}
+		for _, x := range before {
+			start := effectiveStartSecond(x)
+			end := 86400
+			if x.EndSecond != nil {
+				end = *x.EndSecond
+			} else if x.EndMinute != nil {
+				end = *x.EndMinute * 60
+			}
+			if end <= second {
+				after = append(after, x)
+				continue
+			}
+			if start < second {
+				x.EndSecond = intPointer(second)
+				x.EndMinute = intPointer(second / 60)
+				after = append(after, x)
+			}
+			break
 		}
-		if _, err = tx.Exec(ctx, `UPDATE duty_segments SET end_minute=$2,end_second=$3 WHERE id=$1::uuid`, openID, minute, second); err == nil {
-			_, err = tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin,location_text,odometer_miles) VALUES($1,$2,$3,$4,NULL,NULL,$5,$6,$7,$8,$9)`, driverID, logDate, minute, second, status, note, origin, locationText, odometer)
+		after = append(after, SegmentResponse{StartMinute: minute, StartSecond: second, EndMinute: intPointer(1440), EndSecond: intPointer(86400), DutyStatus: status, Note: note, Origin: origin, LocationText: locationText, OdometerMiles: odometer})
+		today := driverCurrentDateServer(ctx, tx, driverID)
+		if err = s.replaceDaySegmentsTx(ctx, tx, driverID, logDate, after, logDate == today); err != nil {
+			return "", 0, 0, false, err
+		}
+		// Remove only derived future projections so late offline events propagate accurately.
+		if _, err = tx.Exec(ctx, `DELETE FROM duty_segments WHERE driver_id=$1 AND log_date>$2::date AND origin='System' AND edited=false`, driverID, logDate); err != nil {
+			return "", 0, 0, false, err
 		}
 	}
-	if err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE duty_segments SET end_minute=1440,end_second=86400 WHERE driver_id=$1 AND log_date<$2::date AND end_minute IS NULL`, driverID, logDate); err != nil {
 		return "", 0, 0, false, err
 	}
 	if changed || !hadOpen {
@@ -224,23 +247,56 @@ func (s *Server) handleDriverTelemetry(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	// Some Android/mock providers move coordinates correctly but report speed as zero.
-	// Derive a fallback speed from the previous GPS fix so sustained real movement can still enter DR.
-	var previousLat, previousLon float64
-	var previousRecordedAt *time.Time
-	_ = tx.QueryRow(r.Context(), `SELECT latitude,longitude,gps_recorded_at FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&previousLat, &previousLon, &previousRecordedAt)
-	effectiveSpeedMPS := math.Max(0, in.SpeedMPS)
-	if previousRecordedAt != nil && validCoordinates(previousLat, previousLon) && at.After(*previousRecordedAt) {
-		dt := at.Sub(*previousRecordedAt).Seconds()
-		if dt >= 1 && dt <= 120 {
-			distanceMeters := haversineMiles(previousLat, previousLon, in.Latitude, in.Longitude) * 1609.344
-			derived := distanceMeters / dt
-			if derived >= 0 && derived <= 80 && derived > effectiveSpeedMPS {
-				effectiveSpeedMPS = derived
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	duplicate, err := acceptMobileEvent(r.Context(), tx, driverID, in.ClientEventID, "telemetry", at)
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if duplicate {
+		writeJSON(w, 200, map[string]any{"ok": true, "duplicate": true})
+		return
+	}
+	var previousAt, latestStatus *time.Time
+	var previousLat, previousLon, previousAccuracy float64
+	_ = tx.QueryRow(r.Context(), `SELECT latitude,longitude,gps_accuracy_meters,gps_recorded_at,status_since FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&previousLat, &previousLon, &previousAccuracy, &previousAt, &latestStatus)
+	if latestStatus != nil && at.Before(*latestStatus) {
+		writeError(w, 409, "Offline sample predates a newer status change; review the saved queue before retrying")
+		return
+	}
+	validSpeed := in.SpeedValid == nil || *in.SpeedValid
+	if in.MotionVersion < 17 {
+		// Old clients cannot distinguish measured zero from GPS drift. Confirm positive
+		// speed with displacement beyond BOTH fixes' horizontal uncertainty.
+		validSpeed = in.AccuracyMeters > 0 && in.AccuracyMeters <= 35
+		if in.SpeedMPS > autoDriveStopSpeedMPS {
+			if previousAt == nil || !at.After(*previousAt) || at.Sub(*previousAt) > 15*time.Second {
+				validSpeed = false
+			} else {
+				dt := at.Sub(*previousAt).Seconds()
+				distance := haversineMiles(previousLat, previousLon, in.Latitude, in.Longitude) * 1609.344
+				conservative := math.Max(0, distance-in.AccuracyMeters-previousAccuracy) / dt
+				in.SpeedMPS = math.Min(in.SpeedMPS, conservative)
 			}
 		}
 	}
-	in.SpeedMPS = effectiveSpeedMPS
+	if in.AccuracyMeters <= 0 || in.AccuracyMeters > 35 || in.SpeedMPS > 60 {
+		validSpeed = false
+	}
+	if !validSpeed {
+		in.SpeedMPS = 0
+	}
+	stopSeconds := 60
+	if in.AutoStopSeconds != nil {
+		stopSeconds = *in.AutoStopSeconds
+	}
+	if stopSeconds != 0 && (stopSeconds < 15 || stopSeconds > 900) {
+		writeError(w, 400, "auto_stop_seconds must be 0 or between 15 and 900")
+		return
+	}
 
 	// Update live GPS first, preserving the current duty status.
 	_, err = tx.Exec(r.Context(), `
@@ -276,9 +332,14 @@ FROM driver_motion_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&movingS
 		return
 	}
 
+	if previousAt == nil || at.Sub(*previousAt) > 15*time.Second {
+		movingSamples = 0
+		movingStartedAt = nil
+		stoppedSince = nil
+	}
 	started, ended := false, false
 	if activeDriveID == nil || *activeDriveID == "" {
-		if in.SpeedMPS >= autoDriveStartSpeedMPS && (in.AccuracyMeters <= 300 || in.AccuracyMeters == 0) {
+		if validSpeed && in.SpeedMPS > autoDriveStartSpeedMPS {
 			if movingSamples == 0 || movingStartedAt == nil {
 				t := at
 				movingStartedAt = &t
@@ -293,7 +354,7 @@ FROM driver_motion_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&movingS
 			movingSamples = 0
 			movingStartedAt = nil
 		}
-		if movingSamples >= autoDriveStartSamples && movingStartedAt != nil {
+		if movingSamples >= autoDriveStartSamples && movingStartedAt != nil && at.Sub(*movingStartedAt) >= 6*time.Second {
 			logDate, _, startSecond, _, e := localDriverMoment(r.Context(), tx, driverID, *movingStartedAt)
 			if e != nil {
 				writeError(w, 500, e.Error())
@@ -325,22 +386,25 @@ VALUES($1,$2,'active',$3,$4,$5,$6,$7,$8) RETURNING id::text`, driverID, logDate,
 			writeError(w, 500, err.Error())
 			return
 		}
-		if in.SpeedMPS <= autoDriveStopSpeedMPS {
+		if validSpeed && in.SpeedMPS <= autoDriveStopSpeedMPS {
 			if stoppedSince == nil {
 				t := at
 				stoppedSince = &t
 			}
-			if at.Sub(*stoppedSince) >= autoDriveStopHold {
-				// Close the drive at the first stationary sample, not five minutes later.
-				// This keeps the endpoint tied to the real GPS point where movement stopped.
-				endAt := *stoppedSince
+			if stopSeconds > 0 && at.Sub(*stoppedSince) >= time.Duration(stopSeconds)*time.Second {
+				// The DR hold remains DR until the selected delay expires.
+				endAt := at
 				endLat, endLon, endAccuracy, endSpeed, endOdo := in.Latitude, in.Longitude, in.AccuracyMeters, in.SpeedMPS, in.OdometerMiles
 				endLocation := in.LocationText
-				_ = tx.QueryRow(r.Context(), `
+				pointErr := tx.QueryRow(r.Context(), `
 SELECT latitude,longitude,accuracy_meters,speed_mps,odometer_miles,location_text
 FROM drive_points
-WHERE session_id=$1::uuid AND recorded_at <= $2 + interval '1 second'
+WHERE session_id=$1::uuid AND recorded_at <= $2::timestamptz + interval '1 second'
 ORDER BY recorded_at DESC LIMIT 1`, *activeDriveID, endAt).Scan(&endLat, &endLon, &endAccuracy, &endSpeed, &endOdo, &endLocation)
+				if pointErr != nil && !errors.Is(pointErr, pgx.ErrNoRows) {
+					writeError(w, 500, pointErr.Error())
+					return
+				}
 				_, _, endSecond, _, e := localDriverMoment(r.Context(), tx, driverID, endAt)
 				if e != nil {
 					writeError(w, 500, e.Error())
@@ -386,6 +450,10 @@ ON CONFLICT(driver_id) DO UPDATE SET moving_samples=EXCLUDED.moving_samples,stop
 		writeError(w, 500, err.Error())
 		return
 	}
+	if _, err = tx.Exec(r.Context(), `UPDATE driver_live_state SET gps_recorded_at=$2,gps_speed_mps=$3 WHERE driver_id=$1`, driverID, at, in.SpeedMPS); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -393,7 +461,7 @@ ON CONFLICT(driver_id) DO UPDATE SET moving_samples=EXCLUDED.moving_samples,stop
 	if started || ended {
 		_ = s.recalcHOSFromSegments(r.Context(), driverID)
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "started_drive": started, "ended_drive": ended, "active_drive_id": activeDriveID, "speed_mps": in.SpeedMPS})
+	writeJSON(w, 200, map[string]any{"ok": true, "started_drive": started, "ended_drive": ended, "active_drive_id": activeDriveID, "speed_mps": in.SpeedMPS, "speed_valid": validSpeed})
 }
 
 func formatCoord(v float64) string {
@@ -576,183 +644,6 @@ func (s *Server) normalizeDriveTx(ctx context.Context, tx pgx.Tx, driverID, driv
 		}
 	}
 	return nil
-}
-
-func (s *Server) handleAdminSwap(w http.ResponseWriter, r *http.Request) {
-	driverID := r.PathValue("id")
-	date := r.PathValue("date")
-	var in struct {
-		FirstSegmentID     string `json:"first_segment_id"`
-		SecondSegmentID    string `json:"second_segment_id"`
-		FirstResultSeconds int    `json:"first_result_seconds"`
-		// Legacy v12 fields are kept for a short compatibility window.
-		SegmentAID      string `json:"segment_a_id"`
-		SegmentBID      string `json:"segment_b_id"`
-		FromSegmentID   string `json:"from_segment_id"`
-		TransferSeconds int    `json:"transfer_seconds"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
-		writeError(w, 400, "invalid JSON")
-		return
-	}
-	tx, err := s.db.Begin(r.Context())
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	defer tx.Rollback(r.Context())
-	segs, err := s.scanSegmentsTx(r.Context(), tx, driverID, date)
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-
-	firstID, secondID := strings.TrimSpace(in.FirstSegmentID), strings.TrimSpace(in.SecondSegmentID)
-	if firstID == "" || secondID == "" {
-		// Translate the old v12 transfer request into the new "first result" model.
-		firstID, secondID = strings.TrimSpace(in.SegmentAID), strings.TrimSpace(in.SegmentBID)
-	}
-	firstIndex, secondIndex := -1, -1
-	for i, x := range segs {
-		if x.ID == firstID {
-			firstIndex = i
-		}
-		if x.ID == secondID {
-			secondIndex = i
-		}
-	}
-	if firstIndex < 0 || secondIndex < 0 {
-		writeError(w, 404, "selected status was not found")
-		return
-	}
-	if firstIndex == secondIndex || int(math.Abs(float64(firstIndex-secondIndex))) != 1 {
-		writeError(w, 400, "swap requires two touching statuses")
-		return
-	}
-
-	first := segs[firstIndex]
-	second := segs[secondIndex]
-	firstStart, firstEnd := effectiveStartSecond(first), 86400
-	if first.EndSecond != nil {
-		firstEnd = *first.EndSecond
-	} else if first.EndMinute != nil {
-		firstEnd = *first.EndMinute * 60
-	}
-	secondStart, secondEnd := effectiveStartSecond(second), 86400
-	if second.EndSecond != nil {
-		secondEnd = *second.EndSecond
-	} else if second.EndMinute != nil {
-		secondEnd = *second.EndMinute * 60
-	}
-	if date == driverCurrentDateServer(r.Context(), tx, driverID) {
-		if _, _, nowSecond, _, e := localDriverMoment(r.Context(), tx, driverID, time.Now().UTC()); e == nil {
-			if first.EndSecond == nil && first.EndMinute == nil {
-				firstEnd = nowSecond
-			}
-			if second.EndSecond == nil && second.EndMinute == nil {
-				secondEnd = nowSecond
-			}
-		}
-	}
-	firstDuration := firstEnd - firstStart
-	secondDuration := secondEnd - secondStart
-	if firstDuration <= 0 || secondDuration <= 0 {
-		writeError(w, 400, "selected status duration is invalid")
-		return
-	}
-	totalDuration := firstDuration + secondDuration
-	desiredFirst := in.FirstResultSeconds
-
-	if desiredFirst <= 0 && in.TransferSeconds > 0 {
-		// Legacy behavior compatibility. The frontend no longer sends this form.
-		desiredFirst = firstDuration
-		if in.FromSegmentID == first.ID {
-			desiredFirst -= in.TransferSeconds
-		} else if in.FromSegmentID == second.ID {
-			desiredFirst += in.TransferSeconds
-		}
-	}
-	if desiredFirst <= 0 || desiredFirst >= totalDuration {
-		writeError(w, 400, "result would remove an entire status")
-		return
-	}
-	if desiredFirst == firstDuration {
-		writeError(w, 400, "first selected status duration did not change")
-		return
-	}
-
-	leftIndex, rightIndex := firstIndex, secondIndex
-	if leftIndex > rightIndex {
-		leftIndex, rightIndex = rightIndex, leftIndex
-	}
-	left, right := segs[leftIndex], segs[rightIndex]
-	leftStart := effectiveStartSecond(left)
-	rightEnd := 86400
-	if right.EndSecond != nil {
-		rightEnd = *right.EndSecond
-	} else if right.EndMinute != nil {
-		rightEnd = *right.EndMinute * 60
-	} else if date == driverCurrentDateServer(r.Context(), tx, driverID) {
-		if _, _, nowSecond, _, e := localDriverMoment(r.Context(), tx, driverID, time.Now().UTC()); e == nil {
-			rightEnd = nowSecond
-		}
-	}
-	leftEnd := rightEnd
-	if left.EndSecond != nil {
-		leftEnd = *left.EndSecond
-	} else if left.EndMinute != nil {
-		leftEnd = *left.EndMinute * 60
-	}
-	rightStart := effectiveStartSecond(right)
-	if math.Abs(float64(leftEnd-rightStart)) > 1 {
-		writeError(w, 400, "selected statuses are not contiguous")
-		return
-	}
-
-	var boundary int
-	if firstIndex == leftIndex {
-		// First selected is the left status. Its result runs forward from its fixed start.
-		boundary = leftStart + desiredFirst
-	} else {
-		// First selected is the right status. Its result runs backward from its fixed end.
-		boundary = rightEnd - desiredFirst
-	}
-	if boundary <= leftStart || boundary >= rightEnd {
-		writeError(w, 400, "result would remove an entire status")
-		return
-	}
-
-	beforeJSON, _ := json.Marshal(segs)
-	left.EndSecond = intPointer(boundary)
-	left.EndMinute = intPointer(boundary / 60)
-	right.StartSecond = boundary
-	right.StartMinute = boundary / 60
-	segs[leftIndex], segs[rightIndex] = left, right
-	afterJSON, _ := json.Marshal(segs)
-	if err = s.replaceDaySegmentsTx(r.Context(), tx, driverID, date, segs, date == driverCurrentDateServer(r.Context(), tx, driverID)); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	_, err = tx.Exec(r.Context(), `INSERT INTO log_edit_batches(driver_id,log_date,action,reason,operator_name,start_minute,end_minute,before_segments,after_segments) VALUES($1,$2,'swap','Admin swap','Admin',$3,$4,$5::jsonb,$6::jsonb)`, driverID, date, left.StartMinute, rightEnd/60, string(beforeJSON), string(afterJSON))
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	if err = tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	_ = s.recalcHOSFromSegments(r.Context(), driverID)
-	writeJSON(w, 200, map[string]any{
-		"ok":                    true,
-		"first_segment_id":      first.ID,
-		"second_segment_id":     second.ID,
-		"first_before_seconds":  firstDuration,
-		"first_after_seconds":   desiredFirst,
-		"second_before_seconds": secondDuration,
-		"second_after_seconds":  totalDuration - desiredFirst,
-		"boundary_second":       boundary,
-	})
 }
 
 func driverCurrentDateServer(ctx context.Context, q interface {

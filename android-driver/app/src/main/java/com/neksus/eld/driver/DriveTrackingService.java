@@ -16,6 +16,9 @@ import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import org.json.JSONObject;
 
@@ -35,7 +38,9 @@ public class DriveTrackingService extends Service implements LocationListener {
     private static final String API = "https://neksuseldv1.onrender.com";
     private static final String CHANNEL = "neksus_drive_analyzer";
     private static final int NOTIFICATION_ID = 4200;
-    private final ExecutorService network = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService network = Executors.newSingleThreadScheduledExecutor();
+    private final MotionFilter motionFilter=new MotionFilter();
+    private long lastFixElapsed=0, lastGpsElapsed=0;
     private final ExecutorService geocoderWorker = Executors.newSingleThreadExecutor();
     private LocationManager locationManager;
     private long lastSentAt = 0L;
@@ -52,6 +57,7 @@ public class DriveTrackingService extends Service implements LocationListener {
         createChannel();
         startForeground(NOTIFICATION_ID, notification("Waiting for GPS"));
         beginLocationUpdates();
+        network.scheduleWithFixedDelay(this::flushOutbox,0,5,TimeUnit.SECONDS);
     }
 
     @Override
@@ -99,40 +105,31 @@ public class DriveTrackingService extends Service implements LocationListener {
     @Override
     public void onLocationChanged(Location location) {
         if (location == null) return;
-        long now = System.currentTimeMillis();
-        // Calculate movement immediately. Reverse geocoding must never block DR detection.
-        double effectiveSpeedMps = effectiveSpeedMps(location);
-        String locationText = cachedLocationText(location.getLatitude(), location.getLongitude());
-        persistLocation(location, locationText, effectiveSpeedMps);
-        scheduleReverseGeocode(location.getLatitude(), location.getLongitude());
-        double mph = effectiveSpeedMps * 2.2369362921;
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null) nm.notify(NOTIFICATION_ID, notification(String.format(Locale.US, "GPS active · %.1f mph", mph)));
-        if (now - lastSentAt < 2500L) return;
-        lastSentAt = now;
-        String auth = token();
-        if (auth.isEmpty()) return;
-        network.execute(() -> sendTelemetry(auth, location, locationText, effectiveSpeedMps));
-    }
-
-    private double effectiveSpeedMps(Location current) {
-        double reported = current.hasSpeed() ? Math.max(0, current.getSpeed()) : 0;
-        double derived = 0;
-        long currentWall = System.currentTimeMillis();
-        if (lastMotionLocation != null) {
-            long dtMs = currentWall - lastMotionWallMs;
-            if (dtMs >= 1000L && dtMs <= 120000L) {
-                float meters = lastMotionLocation.distanceTo(current);
-                double candidate = meters / (dtMs / 1000.0);
-                // Ignore impossible coordinate jumps, but accept mock/provider movement with no speed field.
-                if (candidate >= 0 && candidate <= 80.0) derived = candidate;
-            }
-        }
-        if (lastMotionLocation == null || currentWall >= lastMotionWallMs) {
-            lastMotionLocation = new Location(current);
-            lastMotionWallMs = currentWall;
-        }
-        return Math.max(reported, derived);
+        long now=System.currentTimeMillis(),elapsed=location.getElapsedRealtimeNanos()/1000000L;
+        long age=SystemClock.elapsedRealtime()-elapsed;
+        if(age<0||age>15000||elapsed<=lastFixElapsed)return;
+        String provider=location.getProvider()==null?"unknown":location.getProvider();
+        if(LocationManager.GPS_PROVIDER.equals(provider))lastGpsElapsed=elapsed;
+        else if(lastGpsElapsed>0&&elapsed-lastGpsElapsed<15000)return;
+        lastFixElapsed=elapsed;
+        double speed=motionFilter.sample(provider,elapsed,location.getLatitude(),location.getLongitude(),location.hasAccuracy()?location.getAccuracy():0,location.hasSpeed(),location.getSpeed(),location.hasSpeedAccuracy()?location.getSpeedAccuracyMetersPerSecond():-1);
+        String label=cachedLocationText(location.getLatitude(),location.getLongitude());
+        persistLocation(location,label,Math.max(0,speed));
+        getSharedPreferences(MainActivity.PREFS,MODE_PRIVATE).edit().putBoolean("speed_valid",speed>=0).apply();
+        scheduleReverseGeocode(location.getLatitude(),location.getLongitude());
+        NotificationManager nm=getSystemService(NotificationManager.class);
+        if(nm!=null)nm.notify(NOTIFICATION_ID,notification(speed<0?"Waiting for an accurate movement fix":String.format(Locale.US,"GPS active · %.1f mph",speed*2.2369362921)));
+        if(elapsed-lastSentAt<2500L)return;lastSentAt=elapsed;
+        JSONObject session=driverSession();String owner=session.optString("driver_id");
+        if(owner.isEmpty()||!session.optString("token").equals(token()))return;
+        try{
+            JSONObject body=new JSONObject();
+            body.put("latitude",location.getLatitude());body.put("longitude",location.getLongitude());body.put("accuracy_meters",location.hasAccuracy()?location.getAccuracy():0);
+            body.put("speed_mps",Math.max(0,speed));body.put("speed_valid",speed>=0);body.put("motion_version",17);
+            body.put("auto_stop_status",autoStopStatus());body.put("auto_stop_seconds",getSharedPreferences(MainActivity.PREFS,MODE_PRIVATE).getInt("auto_stop_seconds",60));
+            body.put("odometer_miles",odometer());body.put("location_text",label);body.put("recorded_at",isoTime(location.getTime()));
+            OfflineStore.get(this).enqueue(owner,"/v1/driver/telemetry",body,location.getTime(),false);
+        }catch(Exception e){try{OfflineStore.get(this).error(owner,"Unable to save GPS record: "+e.getMessage());}catch(Exception ignored){}}
     }
 
     private void persistLocation(Location l, String locationText, double effectiveSpeedMps) {
@@ -141,7 +138,7 @@ public class DriveTrackingService extends Service implements LocationListener {
         e.putLong(MainActivity.PREF_LAST_LON, Double.doubleToRawLongBits(l.getLongitude()));
         e.putLong(MainActivity.PREF_LAST_ACCURACY, Double.doubleToRawLongBits(l.hasAccuracy() ? l.getAccuracy() : 0));
         e.putLong(MainActivity.PREF_LAST_SPEED, Double.doubleToRawLongBits(effectiveSpeedMps));
-        e.putLong(MainActivity.PREF_LAST_LOCATION_TIME, System.currentTimeMillis());
+        e.putLong(MainActivity.PREF_LAST_LOCATION_TIME, l.getTime());
         e.putString(MainActivity.PREF_LAST_LOCATION_TEXT, locationText);
         e.apply();
     }
@@ -217,34 +214,29 @@ public class DriveTrackingService extends Service implements LocationListener {
         return "OFF".equalsIgnoreCase(v) ? "OFF" : "ON";
     }
 
-    private void sendTelemetry(String auth, Location l, String locationText, double effectiveSpeedMps) {
-        HttpURLConnection conn = null;
-        try {
-            JSONObject body = new JSONObject();
-            body.put("latitude", l.getLatitude());
-            body.put("longitude", l.getLongitude());
-            body.put("accuracy_meters", l.hasAccuracy() ? l.getAccuracy() : 0);
-            body.put("speed_mps", effectiveSpeedMps);
-            body.put("auto_stop_status", autoStopStatus());
-            body.put("odometer_miles", odometer());
-            body.put("location_text", locationText);
-            body.put("recorded_at", isoTime(System.currentTimeMillis()));
-            byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
-            conn = (HttpURLConnection) new URL(API + "/v1/driver/telemetry").openConnection();
-            conn.setRequestMethod("POST");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setDoOutput(true);
-            conn.setRequestProperty("Authorization", "Bearer " + auth);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "application/json");
-            conn.setFixedLengthStreamingMode(data.length);
-            try (OutputStream os = conn.getOutputStream()) { os.write(data); }
-            int code = conn.getResponseCode();
-            if (code == 401) stopSelf();
-        } catch (Exception ignored) {
-        } finally {
-            if (conn != null) conn.disconnect();
+    private JSONObject driverSession(){
+        try{return new JSONObject(getSharedPreferences(MainActivity.PREFS,MODE_PRIVATE).getString("driver_session","{}"));}catch(Exception e){return new JSONObject();}
+    }
+
+    private void flushOutbox(){
+        JSONObject session=driverSession();String auth=session.optString("token"),owner=session.optString("driver_id");
+        if(auth.isEmpty()||owner.isEmpty()||!auth.equals(token()))return;
+        OfflineStore store=OfflineStore.get(this);
+        for(int i=0;i<200;i++){
+            HttpURLConnection conn=null;
+            try{
+                if(!auth.equals(token())||!owner.equals(getSharedPreferences(MainActivity.PREFS,MODE_PRIVATE).getString("driver_id","")))return;
+                JSONObject item=store.first(owner);if(item==null){store.error(owner,"");return;}
+                byte[] data=item.getString("payload").getBytes(StandardCharsets.UTF_8);
+                conn=(HttpURLConnection)new URL(API+item.getString("path")).openConnection();
+                conn.setRequestMethod("POST");conn.setConnectTimeout(8000);conn.setReadTimeout(8000);conn.setDoOutput(true);
+                conn.setRequestProperty("Authorization","Bearer "+auth);conn.setRequestProperty("Content-Type","application/json");conn.setFixedLengthStreamingMode(data.length);
+                try(OutputStream os=conn.getOutputStream()){os.write(data);}
+                int code=conn.getResponseCode();
+                if(code>=200&&code<300){store.acknowledge(owner,item.getLong("seq"));store.error(owner,"");}
+                else{store.error(owner,code==401?"Sign in again to sync saved records":code==409?"Saved records need review: a newer server change conflicts with offline data":"Records saved; sync will retry ("+code+")");return;}
+            }catch(Exception e){try{store.error(owner,"Offline · records saved on this phone");}catch(Exception ignored){}return;}
+            finally{if(conn!=null)conn.disconnect();}
         }
     }
 

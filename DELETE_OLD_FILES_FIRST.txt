@@ -1,0 +1,18 @@
+NEKSUS v17 BACKEND FILE INVENTORY
+
+Keep all current files from this release:
+- continuity.go
+- continuity_v17.go
+- control.go
+- fleet.go
+- main.go
+- mobile.go
+- mobile_sync.go
+- swap_undo.go
+- swap_v17.go
+
+Also keep go.mod, go.sum, migrations/ and the regression test files.
+
+Remove only obsolete duplicate copies from earlier releases, such as mobile_v10.go, mobile_v11.go, mobile_v12.go and mobile_v13.go. Do NOT delete continuity_v17.go, swap_v17.go, mobile_sync.go or swap_undo.go: they are required.
+
+Never delete the PostgreSQL database or existing Render environment variables.

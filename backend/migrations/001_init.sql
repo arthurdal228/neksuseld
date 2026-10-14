@@ -426,3 +426,15 @@ UPDATE drivers d
 SET vehicle_id=v.id
 FROM vehicles v
 WHERE d.vehicle_id IS NULL AND d.company_id=v.company_id AND d.truck_unit=v.unit_number;
+
+-- v17 durable mobile replay and atomic multi-day correction history.
+CREATE TABLE IF NOT EXISTS mobile_event_receipts (
+ driver_id TEXT NOT NULL REFERENCES drivers(id), event_id TEXT NOT NULL,
+ kind TEXT NOT NULL, recorded_at TIMESTAMPTZ NOT NULL, received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(driver_id,event_id)
+);
+CREATE TABLE IF NOT EXISTS mobile_sync_cursor (
+ driver_id TEXT PRIMARY KEY REFERENCES drivers(id), recorded_at TIMESTAMPTZ NOT NULL
+);
+ALTER TABLE log_edit_batches ADD COLUMN IF NOT EXISTS operation_id UUID;
+CREATE INDEX IF NOT EXISTS log_edit_operation_idx ON log_edit_batches(operation_id);

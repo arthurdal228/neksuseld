@@ -1,3 +1,7 @@
+## v17 / Android 0.6.0
+
+SQLite offline queue, reliable movement filtering, cached daily logs, configurable stationary delay and no alarm preview controls. Build using the included GitHub Actions workflow. Preserve the installed app data when updating. Requires backend v17.
+
 # NEKSUS Android Driver
 
 Driver-facing Android client for the NEKSUS backend.

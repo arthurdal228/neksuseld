@@ -529,7 +529,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "database": "down"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "neksus-api", "database": "up", "time": time.Now().UTC()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "neksus-api", "version": "17.0.0", "database": "up", "time": time.Now().UTC()})
 }
 
 func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, error) {
@@ -1246,6 +1246,9 @@ func (s *Server) handleDriverSelfLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) {
 	driverID, _ := r.Context().Value(driverIDContextKey).(string)
 	var in struct {
+		ClientEventID  string   `json:"client_event_id"`
+		RecordedAt     string   `json:"recorded_at"`
+		SpeedMPS       float64  `json:"speed_mps"`
 		Status         string   `json:"status"`
 		Note           string   `json:"note"`
 		LocationText   string   `json:"location_text"`
@@ -1276,15 +1279,17 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "current device location is required for a status change")
 		return
 	}
+	at := time.Now().UTC()
+	if in.RecordedAt != "" {
+		t, e := time.Parse(time.RFC3339Nano, in.RecordedAt)
+		if e != nil || t.After(at.Add(time.Minute)) {
+			writeError(w, 400, "invalid recorded_at")
+			return
+		}
+		at = t
+	}
 	// A stopped driver may choose the post-drive status during the one-minute DR hold.
 	// While the truck is still moving, manual status changes remain blocked.
-	var activeCount int
-	var liveSpeed float64
-	_ = s.db.QueryRow(r.Context(), `SELECT COALESCE(gps_speed_mps,0) FROM driver_live_state WHERE driver_id=$1`, driverID).Scan(&liveSpeed)
-	if err := s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err == nil && activeCount > 0 && liveSpeed > autoDriveStopSpeedMPS {
-		writeError(w, http.StatusConflict, "Driving is active while the vehicle is moving")
-		return
-	}
 	if in.Note == "" {
 		in.Note = map[string]string{"OFF": "Off Duty", "SB": "Sleeper Berth"}[status]
 	}
@@ -1294,13 +1299,43 @@ func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	duplicate, err := acceptMobileEvent(r.Context(), tx, driverID, in.ClientEventID, "status", at)
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if duplicate {
+		writeJSON(w, 200, map[string]any{"ok": true, "duplicate": true})
+		return
+	}
+	var activeCount int
+	var liveSpeed float64
+	var since *time.Time
+	_ = tx.QueryRow(r.Context(), `SELECT gps_speed_mps,status_since FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&liveSpeed, &since)
+	if since != nil && at.Before(*since) {
+		writeError(w, 409, "Offline status predates a newer status change; review required")
+		return
+	}
+	if err = tx.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if activeCount > 0 && (liveSpeed > autoDriveStopSpeedMPS || in.SpeedMPS > autoDriveStopSpeedMPS) {
+		writeError(w, 409, "Driving is active while the vehicle is moving")
+		return
+	}
+
 	if activeCount > 0 {
-		if _, err = s.finishActiveDriveSessionTx(r.Context(), tx, driverID, time.Now().UTC(), *in.Latitude, *in.Longitude, in.AccuracyMeters, liveSpeed, strings.TrimSpace(in.LocationText)); err != nil {
+		if _, err = s.finishActiveDriveSessionTx(r.Context(), tx, driverID, at, *in.Latitude, *in.Longitude, in.AccuracyMeters, liveSpeed, strings.TrimSpace(in.LocationText)); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
 	}
-	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, 0, in.AccuracyMeters, 0, time.Now().UTC(), false)
+	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, 0, in.AccuracyMeters, 0, at, false)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -2013,7 +2048,7 @@ SELECT id::text, start_minute, COALESCE(start_second,start_minute*60), end_minut
        CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
        duty_status, special_status, note, origin, edited, revision,
        location_text, odometer_miles, engine_hours, trailer_number, shipping_document, edit_reason
-FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id FOR UPDATE`, id, date)
+FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY COALESCE(start_second,start_minute*60),id FOR UPDATE`, id, date)
 	if err != nil {
 		return nil, err
 	}
@@ -2426,7 +2461,7 @@ func (s *Server) handleAdminRangeEdit(w http.ResponseWriter, r *http.Request) {
 	in.Status = strings.ToUpper(strings.TrimSpace(in.Status))
 	in.SpecialStatus = strings.ToUpper(strings.TrimSpace(in.SpecialStatus))
 	in.Reason = strings.TrimSpace(in.Reason)
-	in.Operator = strings.TrimSpace(in.Operator)
+	in.Operator = operatorName(r.Context())
 	if in.Operator == "" {
 		in.Operator = "Admin"
 	}
@@ -2477,6 +2512,10 @@ func (s *Server) handleAdminRangeEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	beforeRaw, err := s.scanSegmentsTx(r.Context(), tx, driverID, date)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -2539,6 +2578,25 @@ func (s *Server) handleAdminLogUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	var operation *string
+	if err = tx.QueryRow(r.Context(), `SELECT operation_id::text FROM log_edit_batches WHERE driver_id=$1 AND log_date=$2 AND undone_at IS NULL ORDER BY created_at DESC LIMIT 1`, driverID, date).Scan(&operation); err == nil && operation != nil {
+		if err = s.undoSwapTx(r.Context(), tx, driverID, *operation, operatorName(r.Context())); err != nil {
+			writeError(w, 409, err.Error())
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		_ = s.recalcHOSFromSegments(r.Context(), driverID)
+		writeJSON(w, 200, map[string]any{"ok": true, "operation_id": operation})
+		return
+	}
+
 	var batchID string
 	var beforeJSON string
 	var startMinute, endMinute int

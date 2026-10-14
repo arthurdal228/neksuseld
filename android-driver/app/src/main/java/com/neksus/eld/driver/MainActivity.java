@@ -7,7 +7,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
-import android.media.MediaPlayer;
+
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
@@ -34,7 +34,7 @@ public class MainActivity extends Activity {
     private static final int REQ_LOCATION = 1002;
     private static final int REQ_NOTIFICATIONS = 1001;
     private WebView webView;
-    private MediaPlayer previewPlayer;
+
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override
@@ -129,7 +129,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void clearDriverToken() {
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(PREF_TOKEN).apply();
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(PREF_TOKEN).remove("driver_session").remove("driver_id").apply();
             runOnUiThread(() -> {
                 stopService(new Intent(MainActivity.this, AlarmService.class));
                 stopService(new Intent(MainActivity.this, DriveTrackingService.class));
@@ -154,6 +154,7 @@ public class MainActivity extends Activity {
             SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
             JSONObject o = new JSONObject();
             try {
+                o.put("speed_valid",p.getBoolean("speed_valid",false));
                 o.put("permission", hasLocationPermission() ? "granted" : "denied");
                 o.put("latitude", Double.longBitsToDouble(p.getLong(PREF_LAST_LAT, Double.doubleToLongBits(0))));
                 o.put("longitude", Double.longBitsToDouble(p.getLong(PREF_LAST_LON, Double.doubleToLongBits(0))));
@@ -195,33 +196,26 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void previewAlarm(String name) {
-            runOnUiThread(() -> {
-                try {
-                    if (previewPlayer != null) {
-                        previewPlayer.stop();
-                        previewPlayer.release();
-                        previewPlayer = null;
-                    }
-                    int res;
-                    String key = name == null ? "phone_ring" : name.toLowerCase();
-                    switch (key) {
-                        case "rooster": res = R.raw.neksus_rooster; break;
-                        case "siren": res = R.raw.neksus_siren; break;
-                        case "alarm": res = R.raw.neksus_alarm; break;
-                        default: res = R.raw.neksus_phone_ring; break;
-                    }
-                    previewPlayer = MediaPlayer.create(MainActivity.this, res);
-                    if (previewPlayer != null) {
-                        previewPlayer.setOnCompletionListener(mp -> {
-                            mp.release();
-                            if (previewPlayer == mp) previewPlayer = null;
-                        });
-                        previewPlayer.start();
-                    }
-                } catch (Exception ignored) {}
-            });
-        }
+        public void setAutoStopSeconds(String value){try{int n=Integer.parseInt(value);if(n==0||(n>=15&&n<=900))getSharedPreferences(PREFS,MODE_PRIVATE).edit().putInt("auto_stop_seconds",n).apply();}catch(Exception ignored){}}
+        @JavascriptInterface
+        public void setDriverIdentity(String json){try{
+            JSONObject d=new JSONObject(json);String id=d.getString("id");
+            String auth=d.optString("token", "");
+            if(auth.isEmpty())return;
+            JSONObject session=new JSONObject().put("driver_id",id).put("token",auth);
+            getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("driver_session",session.toString()).putString("driver_id",id).putString(PREF_TOKEN,auth).apply();
+            OfflineStore.get(MainActivity.this).seed(id,d.optString("current_status","OFF"),d.optLong("since_ms",System.currentTimeMillis()));
+        }catch(Exception ignored){}}
+        @JavascriptInterface
+        public String getOfflineState(){try{return OfflineStore.get(MainActivity.this).snapshot(getSharedPreferences(PREFS,MODE_PRIVATE).getString("driver_id","")).toString();}catch(Exception e){return "{}";}}
+        @JavascriptInterface
+        public String queueStatus(String json){try{
+            JSONObject body=new JSONObject(json);long now=System.currentTimeMillis();
+            java.text.SimpleDateFormat f=new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",java.util.Locale.US);f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));body.put("recorded_at",f.format(new java.util.Date(now)));
+            String id=getSharedPreferences(PREFS,MODE_PRIVATE).getString("driver_id","");
+            String event=OfflineStore.get(MainActivity.this).enqueue(id,"/v1/driver/status",body,now,true);
+            return new JSONObject().put("ok",true).put("event_id",event).toString();
+        }catch(Exception e){try{return new JSONObject().put("error",e.getMessage()).toString();}catch(Exception ignored){return "{}";}}}
 
         @JavascriptInterface
         public void startDriveAnalyzer() {
@@ -237,11 +231,6 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (previewPlayer != null) {
-            try { previewPlayer.stop(); } catch (Exception ignored) {}
-            previewPlayer.release();
-            previewPlayer = null;
-        }
         if (webView != null) webView.destroy();
         super.onDestroy();
     }
