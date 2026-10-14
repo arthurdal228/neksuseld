@@ -1,0 +1,13 @@
+NEKSUS v17 validation
+
+PASS - Complete Go dependency build and unit tests (Go 1.23.12).
+PASS - SQL migration and integration flow against disposable PGlite storage: missing-day continuity, 0 mph telemetry staying stationary, sustained movement entering DR, configured stop delay, duplicate replay, queued manual status, stale-event rejection, non-adjacent cross-date swap, full-operation Undo.
+PASS - Android Java compile against Android API 35 (temporary R identifiers used for the compile check).
+PASS - Java motion-filter tests: measured zero, GPS drift, coordinate-only sustained movement, duplicate timestamps, poor accuracy.
+PASS - JavaScript syntax: ELD web, Control, Android and v17 extensions.
+PASS - Android XML parsing.
+PASS - Simulated web API browser checks: main/company dashboards, company-only driver list, selected company retained, right-click popup and unsaved notes surviving pointer/focus/live refresh, cross-date swap request, six theme graph colors, settings preview persistence, lower-left sign-out removal.
+PASS - Simulated Android bridge browser checks: cached offline restart, seven-day projection, full-day SB carry, local status changes retaining earlier history, stop-delay setting, alarm-preview removal.
+PASS - Visual inspection: company dashboard, light-theme duty graph and Android offline logs.
+
+Not performed: production database/deployment tests, full Gradle APK assembly or physical-device GPS/background tests. Build the APK in GitHub Actions and verify it on the actual phone after deployment.

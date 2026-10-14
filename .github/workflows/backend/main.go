@@ -1,0 +1,2958 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"embed"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
+)
+
+//go:embed migrations/*.sql
+var migrationFS embed.FS
+
+type Server struct {
+	db             *pgxpool.Pool
+	databaseURL    string
+	hub            *Hub
+	adminToken     string
+	apiToken       string
+	allowedOrigins []string
+}
+
+type Hub struct {
+	mu      sync.RWMutex
+	clients map[*WSClient]struct{}
+}
+
+type WSClient struct {
+	conn     *websocket.Conn
+	mu       sync.Mutex
+	authed   bool
+	identity *WebIdentity
+}
+
+type notifyPayload struct {
+	Table    string `json:"table"`
+	Op       string `json:"op"`
+	DriverID string `json:"driver_id"`
+	ID       string `json:"id"`
+}
+
+type contextKey string
+
+const driverIDContextKey contextKey = "driver_id"
+
+var driverUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{4,40}$`)
+var usdotPattern = regexp.MustCompile(`^[0-9]{1,8}$`)
+
+type CompanyResponse struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	USDOT       string `json:"usdot"`
+	DriverCount int    `json:"driver_count"`
+}
+
+type DriverResponse struct {
+	ID                   string  `json:"id"`
+	CompanyID            string  `json:"company_id"`
+	USDOT                string  `json:"usdot"`
+	Username             string  `json:"username"`
+	FirstName            string  `json:"first_name"`
+	LastName             string  `json:"last_name"`
+	Name                 string  `json:"name"`
+	Carrier              string  `json:"carrier"`
+	Phone                string  `json:"phone"`
+	Email                string  `json:"email"`
+	LicenseIssueState    string  `json:"license_issue_state"`
+	LicenseNumber        string  `json:"license_number"`
+	HomeTerminalTimezone string  `json:"home_terminal_timezone"`
+	Truck                string  `json:"truck"`
+	VehicleID            string  `json:"vehicle_id"`
+	Trailer              string  `json:"trailer"`
+	BOL                  string  `json:"bol"`
+	VehicleType          string  `json:"vehicle_type"`
+	Certified            bool    `json:"certified"`
+	CurrentStatus        string  `json:"current_status"`
+	Connected            bool    `json:"connected"`
+	LocationText         string  `json:"location_text"`
+	Latitude             float64 `json:"latitude"`
+	Longitude            float64 `json:"longitude"`
+	OdometerMiles        float64 `json:"odometer_miles"`
+	GPSAccuracyMeters    float64 `json:"gps_accuracy_meters"`
+	GPSSpeedMPS          float64 `json:"gps_speed_mps"`
+	GPSRecordedAt        *string `json:"gps_recorded_at,omitempty"`
+	StatusSince          *string `json:"status_since,omitempty"`
+	Revision             int64   `json:"revision"`
+}
+
+type HOSResponse struct {
+	DriverID              string  `json:"driver_id"`
+	CurrentStatus         string  `json:"current_status"`
+	BreakRemainingSeconds int     `json:"break_remaining_seconds"`
+	DriveRemainingSeconds int     `json:"drive_remaining_seconds"`
+	ShiftRemainingSeconds int     `json:"shift_remaining_seconds"`
+	CycleRemainingSeconds int     `json:"cycle_remaining_seconds"`
+	ShiftStartedAt        *string `json:"shift_started_at,omitempty"`
+	Last10HResetAt        *string `json:"last_10h_reset_at,omitempty"`
+	Last34HResetAt        *string `json:"last_34h_reset_at,omitempty"`
+	CalculatedAt          string  `json:"calculated_at"`
+	Revision              int64   `json:"revision"`
+}
+
+type LiveStateResponse struct {
+	DriverID          string  `json:"driver_id"`
+	Status            string  `json:"status"`
+	Connected         bool    `json:"connected"`
+	LocationText      string  `json:"location_text"`
+	Latitude          float64 `json:"latitude"`
+	Longitude         float64 `json:"longitude"`
+	OdometerMiles     float64 `json:"odometer_miles"`
+	GPSAccuracyMeters float64 `json:"gps_accuracy_meters"`
+	GPSSpeedMPS       float64 `json:"gps_speed_mps"`
+	GPSRecordedAt     *string `json:"gps_recorded_at,omitempty"`
+	UnitNumber        string  `json:"unit_number"`
+	StatusSince       *string `json:"status_since,omitempty"`
+	Revision          int64   `json:"revision"`
+}
+
+type SegmentResponse struct {
+	ID                     string  `json:"id"`
+	StartMinute            int     `json:"start_minute"`
+	StartSecond            int     `json:"start_second"`
+	EndMinute              *int    `json:"end_minute,omitempty"`
+	EndSecond              *int    `json:"end_second,omitempty"`
+	DutyStatus             string  `json:"duty_status"`
+	SpecialStatus          string  `json:"special_status"`
+	Note                   string  `json:"note"`
+	Origin                 string  `json:"origin"`
+	Edited                 bool    `json:"edited"`
+	Revision               int64   `json:"revision"`
+	LocationText           string  `json:"location_text"`
+	OdometerMiles          float64 `json:"odometer_miles"`
+	EngineHours            float64 `json:"engine_hours"`
+	TrailerNumber          string  `json:"trailer_number"`
+	ShippingDocument       string  `json:"shipping_document"`
+	EditReason             string  `json:"edit_reason"`
+	EpisodeStartDate       string  `json:"episode_start_date,omitempty"`
+	EpisodeStartSecond     int     `json:"episode_start_second,omitempty"`
+	EpisodeEndDate         string  `json:"episode_end_date,omitempty"`
+	EpisodeEndSecond       int     `json:"episode_end_second,omitempty"`
+	EpisodeDurationSeconds int     `json:"episode_duration_seconds,omitempty"`
+	EpisodeOpen            bool    `json:"episode_open,omitempty"`
+}
+
+type LogEditHistoryResponse struct {
+	ID          string  `json:"id"`
+	Action      string  `json:"action"`
+	Reason      string  `json:"reason"`
+	Operator    string  `json:"operator"`
+	StartMinute int     `json:"start_minute"`
+	EndMinute   int     `json:"end_minute"`
+	CreatedAt   string  `json:"created_at"`
+	UndoneAt    *string `json:"undone_at,omitempty"`
+	UndoneBy    string  `json:"undone_by,omitempty"`
+}
+
+type EventResponse struct {
+	ID                string  `json:"id"`
+	Minute            int     `json:"minute"`
+	EventTime         *string `json:"event_time,omitempty"`
+	EventType         string  `json:"event_type"`
+	DutyStatus        *string `json:"duty_status,omitempty"`
+	Note              string  `json:"note"`
+	LocationText      string  `json:"location_text"`
+	Latitude          float64 `json:"latitude"`
+	Longitude         float64 `json:"longitude"`
+	GPSAccuracyMeters float64 `json:"gps_accuracy_meters"`
+	OdometerMiles     float64 `json:"odometer_miles"`
+	EngineHours       float64 `json:"engine_hours"`
+	DurationSeconds   *int    `json:"duration_seconds,omitempty"`
+	Origin            string  `json:"origin"`
+	Diagnostic        bool    `json:"diagnostic"`
+	Violation         bool    `json:"violation"`
+	Edited            bool    `json:"edited"`
+	EditReason        string  `json:"edit_reason"`
+	CoDriver          string  `json:"co_driver"`
+	Revision          int64   `json:"revision"`
+}
+
+type DriveSessionResponse struct {
+	ID                    string  `json:"id"`
+	DriverID              string  `json:"driver_id"`
+	LogDate               string  `json:"log_date"`
+	State                 string  `json:"state"`
+	StartedAt             string  `json:"started_at"`
+	EndedAt               *string `json:"ended_at,omitempty"`
+	StartSecond           int     `json:"start_second"`
+	EndSecond             *int    `json:"end_second,omitempty"`
+	StartLatitude         float64 `json:"start_latitude"`
+	StartLongitude        float64 `json:"start_longitude"`
+	EndLatitude           float64 `json:"end_latitude"`
+	EndLongitude          float64 `json:"end_longitude"`
+	StartLocationText     string  `json:"start_location_text"`
+	EndLocationText       string  `json:"end_location_text"`
+	StartOdometerMiles    float64 `json:"start_odometer_miles"`
+	EndOdometerMiles      float64 `json:"end_odometer_miles"`
+	GPSDistanceMiles      float64 `json:"gps_distance_miles"`
+	OdometerDistanceMiles float64 `json:"odometer_distance_miles"`
+	VarianceMiles         float64 `json:"variance_miles"`
+	VariancePercent       float64 `json:"variance_percent"`
+	Normalized            bool    `json:"normalized"`
+	ReviewReason          string  `json:"review_reason"`
+}
+
+type AlertResponse struct {
+	ID         string `json:"id"`
+	DriverID   string `json:"driver_id"`
+	Kind       string `json:"kind"`
+	Priority   string `json:"priority"`
+	Title      string `json:"title"`
+	Detail     string `json:"detail"`
+	EventID    string `json:"event_id"`
+	Status     string `json:"status"`
+	Owner      string `json:"owner"`
+	Resolution string `json:"resolution"`
+}
+
+type AlarmResponse struct {
+	ID             string  `json:"id"`
+	DriverID       string  `json:"driver_id"`
+	Title          string  `json:"title"`
+	Message        string  `json:"message"`
+	Ringtone       string  `json:"ringtone"`
+	CreatedAt      string  `json:"created_at"`
+	DeliveredAt    *string `json:"delivered_at,omitempty"`
+	AcknowledgedAt *string `json:"acknowledged_at,omitempty"`
+}
+
+func main() {
+	ctx := context.Background()
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		log.Fatalf("database pool: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		log.Fatalf("database ping: %v", err)
+	}
+	if err := runMigrations(ctx, pool); err != nil {
+		log.Fatalf("migrations: %v", err)
+	}
+
+	s := &Server{
+		db:             pool,
+		databaseURL:    databaseURL,
+		hub:            &Hub{clients: map[*WSClient]struct{}{}},
+		adminToken:     strings.TrimSpace(os.Getenv("ADMIN_TOKEN")),
+		apiToken:       strings.TrimSpace(os.Getenv("API_TOKEN")),
+		allowedOrigins: parseOrigins(os.Getenv("ALLOWED_ORIGINS")),
+	}
+	if err := s.bootstrapControlAdmin(ctx); err != nil {
+		log.Fatalf("control admin bootstrap: %v", err)
+	}
+
+	go s.listenForChanges(ctx)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /v1/web/login", s.webLogin)
+	mux.Handle("POST /v1/web/logout", s.webSessionAuth(http.HandlerFunc(s.webLogout)))
+	mux.Handle("GET /v1/web/me", s.webSessionAuth(http.HandlerFunc(s.webMe)))
+	mux.HandleFunc("POST /v1/control/login", s.webLogin)
+	mux.Handle("POST /v1/control/logout", s.webSessionAuth(http.HandlerFunc(s.webLogout)))
+	mux.Handle("GET /v1/control/me", s.webSessionAuth(http.HandlerFunc(s.webMe)))
+	mux.Handle("GET /v1/control/users", s.controlAdminAuth(http.HandlerFunc(s.handleControlUsers)))
+	mux.Handle("POST /v1/control/users", s.controlAdminAuth(http.HandlerFunc(s.handleControlUserCreate)))
+	mux.Handle("PATCH /v1/control/users/{id}", s.controlAdminAuth(http.HandlerFunc(s.handleControlUserUpdate)))
+	mux.Handle("GET /v1/control/companies", s.controlAdminAuth(http.HandlerFunc(s.handleControlCompanies)))
+	mux.Handle("GET /v1/control/activity", s.controlAdminAuth(http.HandlerFunc(s.handleControlActivity)))
+	mux.HandleFunc("POST /v1/driver/login", s.handleDriverLogin)
+	mux.Handle("GET /v1/driver/me", s.driverAuth(http.HandlerFunc(s.handleDriverMe)))
+	mux.Handle("GET /v1/driver/hos", s.driverAuth(http.HandlerFunc(s.handleDriverSelfHOS)))
+	mux.Handle("GET /v1/driver/logs/{date}", s.driverAuth(http.HandlerFunc(s.handleDriverSelfLog)))
+	mux.Handle("POST /v1/driver/status", s.driverAuth(http.HandlerFunc(s.handleDriverSelfStatus)))
+	mux.Handle("POST /v1/driver/heartbeat", s.driverAuth(http.HandlerFunc(s.handleDriverHeartbeat)))
+	mux.Handle("POST /v1/driver/telemetry", s.driverAuth(http.HandlerFunc(s.handleDriverTelemetry)))
+	mux.Handle("GET /v1/driver/drive-state", s.driverAuth(http.HandlerFunc(s.handleDriverDriveState)))
+	mux.Handle("GET /v1/driver/alarms", s.driverAuth(http.HandlerFunc(s.handleDriverAlarms)))
+	mux.Handle("POST /v1/driver/alarms/{id}/delivered", s.driverAuth(http.HandlerFunc(s.handleDriverAlarmDelivered)))
+	mux.Handle("POST /v1/driver/logout", s.driverAuth(http.HandlerFunc(s.handleDriverLogout)))
+	mux.Handle("GET /v1/companies", s.readAuth(http.HandlerFunc(s.handleCompanies)))
+	mux.Handle("GET /v1/drivers", s.readAuth(http.HandlerFunc(s.handleDrivers)))
+	mux.Handle("GET /v1/vehicles", s.readAuth(http.HandlerFunc(s.handleVehicles)))
+	mux.Handle("GET /v1/alerts", s.readAuth(http.HandlerFunc(s.handleAlerts)))
+	mux.Handle("GET /v1/fleet/live", s.readAuth(http.HandlerFunc(s.handleFleetLive)))
+	mux.Handle("GET /v1/hos/current", s.readAuth(http.HandlerFunc(s.handleHOSBulk)))
+	mux.Handle("GET /v1/drivers/{id}/hos", s.readAuth(http.HandlerFunc(s.handleDriverHOS)))
+	mux.Handle("GET /v1/drivers/{id}/logs/{date}", s.readAuth(http.HandlerFunc(s.handleDriverLog)))
+	mux.HandleFunc("GET /v1/ws", s.handleWS)
+
+	mux.Handle("GET /v1/admin/session", s.adminAuth(http.HandlerFunc(s.handleAdminSession)))
+	mux.Handle("POST /v1/admin/companies", s.adminAuth(http.HandlerFunc(s.handleAdminCompany)))
+	mux.Handle("POST /v1/admin/drivers", s.adminAuth(http.HandlerFunc(s.handleAdminDriver)))
+	mux.Handle("POST /v1/admin/vehicles", s.adminAuth(http.HandlerFunc(s.handleAdminVehicle)))
+	mux.Handle("DELETE /v1/admin/vehicles/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminVehicleDelete)))
+	mux.Handle("DELETE /v1/admin/drivers/{id}", s.adminAuth(http.HandlerFunc(s.handleAdminDriverDelete)))
+	mux.Handle("PUT /v1/admin/drivers/{id}/trip-info", s.adminAuth(http.HandlerFunc(s.handleAdminTripInfo)))
+	mux.Handle("PUT /v1/admin/drivers/{id}/live", s.adminAuth(http.HandlerFunc(s.handleAdminLive)))
+	mux.Handle("PUT /v1/admin/drivers/{id}/hos", s.adminAuth(http.HandlerFunc(s.handleAdminHOS)))
+	mux.Handle("POST /v1/admin/drivers/{id}/segments", s.adminAuth(http.HandlerFunc(s.handleAdminSegment)))
+	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/range-edit", s.adminAuth(http.HandlerFunc(s.handleAdminRangeEdit)))
+	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/undo", s.adminAuth(http.HandlerFunc(s.handleAdminLogUndo)))
+	mux.Handle("POST /v1/admin/drivers/{id}/logs/{date}/swap", s.adminAuth(http.HandlerFunc(s.handleAdminSwap)))
+	mux.Handle("POST /v1/admin/drivers/{id}/events", s.adminAuth(http.HandlerFunc(s.handleAdminEvent)))
+	mux.Handle("POST /v1/admin/drivers/{id}/alarms", s.adminAuth(http.HandlerFunc(s.handleAdminDriverAlarm)))
+	mux.Handle("POST /v1/admin/alerts", s.adminAuth(http.HandlerFunc(s.handleAdminAlert)))
+
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "10000"
+	}
+	addr := ":" + port
+	log.Printf("NEKSUS API listening on %s", addr)
+	if err := http.ListenAndServe(addr, s.cors(mux)); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
+	b, err := migrationFS.ReadFile("migrations/001_init.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, string(b))
+	return err
+}
+
+func parseOrigins(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{"*"}
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, strings.TrimRight(p, "/"))
+		}
+	}
+	if len(out) == 0 {
+		return []string{"*"}
+	}
+	return out
+}
+
+func (s *Server) originAllowed(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	origin = strings.TrimRight(origin, "/")
+	for _, o := range s.allowedOrigins {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && s.originAllowed(origin) {
+			if len(s.allowedOrigins) == 1 && s.allowedOrigins[0] == "*" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bearer(r *http.Request) string {
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
+}
+
+func (s *Server) readAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		i, err := s.authWebToken(r, false)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		if id := strings.TrimSpace(r.PathValue("id")); id != "" && strings.Contains(r.URL.Path, "/drivers/") && !s.ensureDriverAllowed(r.Context(), i, id) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+		ctx := context.WithValue(r.Context(), webIdentityContextKey, i)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) adminAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		i, err := s.authWebToken(r, true)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "operator login required")
+			return
+		}
+		driverID := ""
+		if id := strings.TrimSpace(r.PathValue("id")); id != "" && strings.Contains(r.URL.Path, "/drivers/") {
+			driverID = id
+			if !s.ensureDriverAllowed(r.Context(), i, id) {
+				writeError(w, http.StatusForbidden, "driver is outside your company access")
+				return
+			}
+		}
+		ctx := context.WithValue(r.Context(), webIdentityContextKey, i)
+		cw := &statusCaptureWriter{ResponseWriter: w}
+		next.ServeHTTP(cw, r.WithContext(ctx))
+		if !i.Legacy && cw.status < 400 {
+			companyID := ""
+			if driverID != "" {
+				companyID, _ = s.driverCompanyID(r.Context(), driverID)
+			}
+			s.logWebActivity(r.Context(), i, r.Method+" "+r.URL.Path, companyID, driverID, map[string]any{"status": cw.status})
+		}
+	})
+}
+
+func (s *Server) driverAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := bearer(r)
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "driver login required")
+			return
+		}
+		hash := sha256.Sum256([]byte(token))
+		var driverID string
+		err := s.db.QueryRow(r.Context(), `
+SELECT ds.driver_id
+FROM driver_sessions ds
+JOIN drivers d ON d.id=ds.driver_id
+WHERE ds.token_hash=$1 AND ds.expires_at>now() AND d.active=true`, hash[:]).Scan(&driverID)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "driver session expired or invalid")
+			return
+		}
+		_, _ = s.db.Exec(r.Context(), `UPDATE driver_sessions SET last_seen_at=now() WHERE token_hash=$1`, hash[:])
+		ctx := context.WithValue(r.Context(), driverIDContextKey, driverID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func generateDriverID() (string, error) {
+	b := make([]byte, 5)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "DRV-" + strings.ToUpper(hex.EncodeToString(b)), nil
+}
+
+func generateSessionToken() (string, []byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", nil, err
+	}
+	token := base64.RawURLEncoding.EncodeToString(b)
+	hash := sha256.Sum256([]byte(token))
+	return token, hash[:], nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]any{"error": msg, "status": status})
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nilWriter{}, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
+
+type nilWriter struct{}
+
+func (nilWriter) Header() http.Header       { return http.Header{} }
+func (nilWriter) Write([]byte) (int, error) { return 0, nil }
+func (nilWriter) WriteHeader(int)           {}
+
+func timeString(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.db.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "database": "down"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "neksus-api", "version": "17.0.0", "database": "up", "time": time.Now().UTC()})
+}
+
+func (s *Server) queryDriver(ctx context.Context, id string) (DriverResponse, error) {
+	var d DriverResponse
+	var statusSince, gpsRecordedAt *time.Time
+	err := s.db.QueryRow(ctx, `
+SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, COALESCE(d.vehicle_id::text,''), d.trailer_number, d.shipping_document,
+       d.vehicle_type, d.certified,
+       COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
+       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
+       COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       ls.status_since, COALESCE(ls.revision,0)
+FROM drivers d
+LEFT JOIN companies c ON c.id=d.company_id
+LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
+WHERE d.id=$1 AND d.active=true`, id).Scan(
+		&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+		&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.VehicleID, &d.Trailer, &d.BOL,
+		&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
+		&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision,
+	)
+	d.StatusSince = timeString(statusSince)
+	d.GPSRecordedAt = timeString(gpsRecordedAt)
+	return d, err
+}
+
+func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
+	limit := 500
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT d.id, COALESCE(d.company_id::text,''), COALESCE(c.usdot,''), d.username, d.first_name, d.last_name, d.full_name, COALESCE(c.name,d.carrier), d.phone, d.email,
+       d.license_issue_state, d.license_number, d.home_terminal_timezone, d.truck_unit, COALESCE(d.vehicle_id::text,''), d.trailer_number, d.shipping_document,
+       d.vehicle_type, d.certified,
+       COALESCE(ls.duty_status,'OFF'), COALESCE(ls.connected,false), COALESCE(ls.location_text,''),
+       COALESCE(ls.latitude,0), COALESCE(ls.longitude,0), COALESCE(ls.odometer_miles,0),
+       COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       ls.status_since, COALESCE(ls.revision,0)
+FROM drivers d
+LEFT JOIN companies c ON c.id=d.company_id
+LEFT JOIN driver_live_state ls ON ls.driver_id=d.id
+WHERE d.active=true
+ORDER BY d.full_name
+LIMIT $1`, limit)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []DriverResponse{}
+	for rows.Next() {
+		var d DriverResponse
+		var statusSince, gpsRecordedAt *time.Time
+		if err := rows.Scan(&d.ID, &d.CompanyID, &d.USDOT, &d.Username, &d.FirstName, &d.LastName, &d.Name, &d.Carrier, &d.Phone, &d.Email,
+			&d.LicenseIssueState, &d.LicenseNumber, &d.HomeTerminalTimezone, &d.Truck, &d.VehicleID, &d.Trailer, &d.BOL,
+			&d.VehicleType, &d.Certified, &d.CurrentStatus, &d.Connected, &d.LocationText, &d.Latitude,
+			&d.Longitude, &d.OdometerMiles, &d.GPSAccuracyMeters, &d.GPSSpeedMPS, &gpsRecordedAt, &statusSince, &d.Revision); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		d.StatusSince = timeString(statusSince)
+		d.GPSRecordedAt = timeString(gpsRecordedAt)
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(d.CompanyID) {
+			continue
+		}
+		out = append(out, d)
+	}
+	writeJSON(w, 200, map[string]any{"drivers": out})
+}
+
+func (s *Server) handleCompanies(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+SELECT c.id::text,c.name,c.usdot,count(d.id)::int
+FROM companies c
+LEFT JOIN drivers d ON d.company_id=c.id AND d.active=true
+GROUP BY c.id,c.name,c.usdot
+ORDER BY c.name`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []CompanyResponse{}
+	for rows.Next() {
+		var c CompanyResponse
+		if err := rows.Scan(&c.ID, &c.Name, &c.USDOT, &c.DriverCount); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(c.ID) {
+			continue
+		}
+		out = append(out, c)
+	}
+	writeJSON(w, 200, map[string]any{"companies": out})
+}
+
+func (s *Server) handleAdminCompany(w http.ResponseWriter, r *http.Request) {
+	if i := identityFromContext(r.Context()); i != nil && !i.canManageCompanies() {
+		writeError(w, http.StatusForbidden, "manager access required")
+		return
+	}
+	var in struct {
+		Name  string `json:"name"`
+		USDOT string `json:"usdot"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.USDOT = strings.TrimSpace(in.USDOT)
+	if in.Name == "" || len(in.Name) > 120 {
+		writeError(w, 400, "company name is required and must be 120 characters or less")
+		return
+	}
+	if !usdotPattern.MatchString(in.USDOT) {
+		writeError(w, 400, "USDOT must contain 1-8 digits")
+		return
+	}
+	var c CompanyResponse
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO companies(name,usdot)
+VALUES($1,$2)
+ON CONFLICT(name) DO UPDATE SET usdot=EXCLUDED.usdot WHERE companies.usdot=''
+RETURNING id::text,name,usdot`, in.Name, in.USDOT).Scan(&c.ID, &c.Name, &c.USDOT)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "usdot") || strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
+			writeError(w, http.StatusConflict, "company name or USDOT already exists")
+			return
+		}
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.db.QueryRow(r.Context(), `SELECT count(*)::int FROM drivers WHERE company_id=$1::uuid AND active=true`, c.ID).Scan(&c.DriverCount)
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) queryHOS(ctx context.Context, id string) (HOSResponse, error) {
+	var h HOSResponse
+	var shift, r10, r34 *time.Time
+	var calc time.Time
+	err := s.db.QueryRow(ctx, `
+SELECT h.driver_id, COALESCE(ls.duty_status,'OFF'), h.break_remaining_seconds,
+       h.drive_remaining_seconds, h.shift_remaining_seconds, h.cycle_remaining_seconds,
+       h.shift_started_at, h.last_10h_reset_at, h.last_34h_reset_at, h.calculated_at, h.revision
+FROM driver_hos_current h
+LEFT JOIN driver_live_state ls ON ls.driver_id=h.driver_id
+WHERE h.driver_id=$1`, id).Scan(&h.DriverID, &h.CurrentStatus, &h.BreakRemainingSeconds,
+		&h.DriveRemainingSeconds, &h.ShiftRemainingSeconds, &h.CycleRemainingSeconds,
+		&shift, &r10, &r34, &calc, &h.Revision)
+	if err != nil {
+		return h, err
+	}
+	h.ShiftStartedAt = timeString(shift)
+	h.Last10HResetAt = timeString(r10)
+	h.Last34HResetAt = timeString(r34)
+	h.CalculatedAt = calc.UTC().Format(time.RFC3339)
+	return h, nil
+}
+
+func (s *Server) handleDriverHOS(w http.ResponseWriter, r *http.Request) {
+	h, err := s.queryHOS(r.Context(), r.PathValue("id"))
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 404, "HOS not found")
+		return
+	}
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, h)
+}
+
+func (s *Server) handleHOSBulk(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+SELECT h.driver_id, COALESCE(ls.duty_status,'OFF'), h.break_remaining_seconds,
+       h.drive_remaining_seconds, h.shift_remaining_seconds, h.cycle_remaining_seconds,
+       h.shift_started_at, h.last_10h_reset_at, h.last_34h_reset_at, h.calculated_at, h.revision
+FROM driver_hos_current h
+LEFT JOIN driver_live_state ls ON ls.driver_id=h.driver_id
+JOIN drivers d ON d.id=h.driver_id AND d.active=true
+ORDER BY h.driver_id`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []HOSResponse{}
+	for rows.Next() {
+		var h HOSResponse
+		var shift, r10, r34 *time.Time
+		var calc time.Time
+		if err := rows.Scan(&h.DriverID, &h.CurrentStatus, &h.BreakRemainingSeconds,
+			&h.DriveRemainingSeconds, &h.ShiftRemainingSeconds, &h.CycleRemainingSeconds,
+			&shift, &r10, &r34, &calc, &h.Revision); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		h.ShiftStartedAt = timeString(shift)
+		h.Last10HResetAt = timeString(r10)
+		h.Last34HResetAt = timeString(r34)
+		h.CalculatedAt = calc.UTC().Format(time.RFC3339)
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, h.DriverID) {
+			continue
+		}
+		out = append(out, h)
+	}
+	writeJSON(w, 200, map[string]any{"hos": out})
+}
+
+func (s *Server) queryLiveState(ctx context.Context, id string) (LiveStateResponse, error) {
+	var x LiveStateResponse
+	var since, gpsRecordedAt *time.Time
+	err := s.db.QueryRow(ctx, `
+SELECT ls.driver_id, ls.duty_status, ls.connected, ls.location_text, ls.latitude, ls.longitude,
+       COALESCE(ls.odometer_miles,0), COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       d.truck_unit, ls.status_since, ls.revision
+FROM driver_live_state ls JOIN drivers d ON d.id=ls.driver_id
+WHERE ls.driver_id=$1 AND d.active=true`, id).Scan(&x.DriverID, &x.Status, &x.Connected,
+		&x.LocationText, &x.Latitude, &x.Longitude, &x.OdometerMiles, &x.GPSAccuracyMeters, &x.GPSSpeedMPS, &gpsRecordedAt, &x.UnitNumber, &since, &x.Revision)
+	x.StatusSince = timeString(since)
+	x.GPSRecordedAt = timeString(gpsRecordedAt)
+	return x, err
+}
+
+func (s *Server) handleFleetLive(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+SELECT ls.driver_id, ls.duty_status, ls.connected, ls.location_text, ls.latitude, ls.longitude,
+       COALESCE(ls.odometer_miles,0), COALESCE(ls.gps_accuracy_meters,0), COALESCE(ls.gps_speed_mps,0), ls.gps_recorded_at,
+       d.truck_unit, ls.status_since, ls.revision
+FROM driver_live_state ls JOIN drivers d ON d.id=ls.driver_id
+WHERE d.active=true ORDER BY d.full_name`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []LiveStateResponse{}
+	for rows.Next() {
+		var x LiveStateResponse
+		var since, gpsRecordedAt *time.Time
+		if err := rows.Scan(&x.DriverID, &x.Status, &x.Connected, &x.LocationText, &x.Latitude,
+			&x.Longitude, &x.OdometerMiles, &x.GPSAccuracyMeters, &x.GPSSpeedMPS, &gpsRecordedAt, &x.UnitNumber, &since, &x.Revision); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		x.StatusSince = timeString(since)
+		x.GPSRecordedAt = timeString(gpsRecordedAt)
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, x.DriverID) {
+			continue
+		}
+		out = append(out, x)
+	}
+	writeJSON(w, 200, map[string]any{"drivers": out})
+}
+
+func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status == "" {
+		status = "open"
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text, COALESCE(driver_id,''), kind, priority, title, detail, event_id, status, owner, resolution
+FROM alerts WHERE status=$1 ORDER BY created_at DESC LIMIT 1000`, status)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []AlertResponse{}
+	for rows.Next() {
+		var a AlertResponse
+		if err := rows.Scan(&a.ID, &a.DriverID, &a.Kind, &a.Priority, &a.Title, &a.Detail,
+			&a.EventID, &a.Status, &a.Owner, &a.Resolution); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		if a.DriverID != "" {
+			if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, a.DriverID) {
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	writeJSON(w, 200, map[string]any{"alerts": out})
+}
+
+func scanSegments(ctx context.Context, db *pgxpool.Pool, id, date string) ([]SegmentResponse, error) {
+	segs := []SegmentResponse{}
+	rows, err := db.Query(ctx, `
+SELECT id::text, start_minute, COALESCE(start_second,start_minute*60), end_minute,
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status, note, origin, edited, revision,
+       location_text, odometer_miles, engine_hours, trailer_number, shipping_document, edit_reason
+FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY start_minute,id`, id, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var x SegmentResponse
+		if err := rows.Scan(&x.ID, &x.StartMinute, &x.StartSecond, &x.EndMinute, &x.EndSecond, &x.DutyStatus, &x.SpecialStatus,
+			&x.Note, &x.Origin, &x.Edited, &x.Revision, &x.LocationText, &x.OdometerMiles,
+			&x.EngineHours, &x.TrailerNumber, &x.ShippingDocument, &x.EditReason); err != nil {
+			return nil, err
+		}
+		segs = append(segs, x)
+	}
+	return segs, rows.Err()
+}
+
+type episodeFragment struct {
+	id           string
+	date         string
+	dayIndex     int
+	startSecond  int
+	endSecond    int
+	status       string
+	special      string
+	open         bool
+	episodeStart int
+	episodeEnd   int
+}
+
+func parseLogDateUTC(v string) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02", v, time.UTC)
+}
+
+func logDayDistance(a, b string) int {
+	ta, errA := parseLogDateUTC(a)
+	tb, errB := parseLogDateUTC(b)
+	if errA != nil || errB != nil {
+		return 0
+	}
+	return int(tb.Sub(ta).Hours() / 24)
+}
+
+func absEpisodePosition(baseDate, date string, second int) int {
+	return logDayDistance(baseDate, date)*86400 + second
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func splitEpisodePosition(baseDate string, absolute int) (string, int) {
+	base, err := parseLogDateUTC(baseDate)
+	if err != nil {
+		return baseDate, 0
+	}
+	day := absolute / 86400
+	second := absolute % 86400
+	if second < 0 {
+		second += 86400
+		day--
+	}
+	return base.AddDate(0, 0, day).Format("2006-01-02"), second
+}
+
+// enrichSegmentEpisodes keeps each daily graph fragment intact while attaching the
+// full continuous duty-status episode across midnight boundaries. This lets the
+// UI show 13h44m (or multi-day OFF duty) instead of resetting duration at midnight.
+func (s *Server) enrichSegmentEpisodes(ctx context.Context, driverID, requestedDate, timezone string, segs []SegmentResponse) []SegmentResponse {
+	if len(segs) == 0 {
+		return segs
+	}
+	requested, err := parseLogDateUTC(requestedDate)
+	if err != nil {
+		return segs
+	}
+	windowStart := requested.AddDate(0, 0, -35).Format("2006-01-02")
+	windowEnd := requested.AddDate(0, 0, 35).Format("2006-01-02")
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	localNow := time.Now().In(loc)
+	today := localNow.Format("2006-01-02")
+	nowSecond := localNow.Hour()*3600 + localNow.Minute()*60 + localNow.Second()
+
+	rows, err := s.db.Query(ctx, `
+SELECT id::text, to_char(log_date,'YYYY-MM-DD'), COALESCE(start_second,start_minute*60),
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status
+FROM duty_segments
+WHERE driver_id=$1 AND log_date BETWEEN $2::date AND $3::date
+ORDER BY log_date, COALESCE(start_second,start_minute*60), id`, driverID, windowStart, windowEnd)
+	if err != nil {
+		return segs
+	}
+	defer rows.Close()
+	frags := make([]episodeFragment, 0, 64)
+	baseDate := windowStart
+	for rows.Next() {
+		var f episodeFragment
+		var end *int
+		if err := rows.Scan(&f.id, &f.date, &f.startSecond, &end, &f.status, &f.special); err != nil {
+			return segs
+		}
+		f.dayIndex = logDayDistance(baseDate, f.date)
+		if end == nil {
+			f.open = true
+			if f.date == today {
+				f.endSecond = nowSecond
+			} else if f.date < today {
+				f.endSecond = 86400
+			} else {
+				f.endSecond = f.startSecond
+			}
+		} else {
+			f.endSecond = *end
+		}
+		if f.endSecond < f.startSecond {
+			f.endSecond = f.startSecond
+		}
+		f.episodeStart = absEpisodePosition(baseDate, f.date, f.startSecond)
+		f.episodeEnd = absEpisodePosition(baseDate, f.date, f.endSecond)
+		frags = append(frags, f)
+	}
+	if len(frags) == 0 {
+		return segs
+	}
+
+	// Build contiguous groups. Same-status fragments touching at midnight are one episode.
+	groupStart := 0
+	for i := 0; i < len(frags); i++ {
+		if i > 0 {
+			p := frags[i-1]
+			c := frags[i]
+			contiguous := absInt(p.episodeEnd-c.episodeStart) <= 2 && p.status == c.status && p.special == c.special
+			if !contiguous {
+				startAbs := frags[groupStart].episodeStart
+				endAbs := frags[i-1].episodeEnd
+				for j := groupStart; j < i; j++ {
+					frags[j].episodeStart = startAbs
+					frags[j].episodeEnd = endAbs
+				}
+				groupStart = i
+			}
+		}
+	}
+	startAbs := frags[groupStart].episodeStart
+	endAbs := frags[len(frags)-1].episodeEnd
+	for j := groupStart; j < len(frags); j++ {
+		frags[j].episodeStart = startAbs
+		frags[j].episodeEnd = endAbs
+	}
+
+	byID := make(map[string]episodeFragment, len(frags))
+	for _, f := range frags {
+		byID[f.id] = f
+	}
+	for i := range segs {
+		f, ok := byID[segs[i].ID]
+		if !ok {
+			continue
+		}
+		startDate, startSecond := splitEpisodePosition(baseDate, f.episodeStart)
+		endDate, endSecond := splitEpisodePosition(baseDate, f.episodeEnd)
+		segs[i].EpisodeStartDate = startDate
+		segs[i].EpisodeStartSecond = startSecond
+		segs[i].EpisodeEndDate = endDate
+		segs[i].EpisodeEndSecond = endSecond
+		segs[i].EpisodeDurationSeconds = f.episodeEnd - f.episodeStart
+		segs[i].EpisodeOpen = f.open || (endDate == today && endSecond >= nowSecond-2)
+	}
+	return segs
+}
+
+func (s *Server) repairCurrentLogIfEmpty(ctx context.Context, id, date, timezone string) error {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now := time.Now().UTC()
+	localNow := now.In(loc)
+	if localNow.Format("2006-01-02") != date {
+		return nil
+	}
+	var status, locationText string
+	var statusSince *time.Time
+	err = s.db.QueryRow(ctx, `SELECT duty_status,location_text,status_since FROM driver_live_state WHERE driver_id=$1`, id).Scan(&status, &locationText, &statusSince)
+	if errors.Is(err, pgx.ErrNoRows) {
+		status = "OFF"
+		statusSince = nil
+	} else if err != nil {
+		return err
+	}
+	if normalized, ok := normalizeStatus(status); ok {
+		status = normalized
+	} else {
+		status = "OFF"
+	}
+	startMinute := 0
+	if statusSince != nil {
+		s := statusSince.In(loc)
+		if s.Format("2006-01-02") == date {
+			startMinute = s.Hour()*60 + s.Minute()
+		}
+	}
+	if startMinute < 0 || startMinute > 1440 {
+		startMinute = 0
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM duty_segments WHERE driver_id=$1 AND log_date=$2`, id, date).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return tx.Commit(ctx)
+	}
+	if status != "OFF" && startMinute > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,0,$3,'OFF','Recovered online log continuity','System')`, id, date, startMinute); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,note,origin) VALUES($1,$2,$3,NULL,$4,'Recovered current online status','System')`, id, date, startMinute, status); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,origin) VALUES($1,$2,$3,$4,'duty_status',$5,'Recovered current online status',$6,'System')`, id, date, startMinute, now, status, locationText); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Server) handleDriverLog(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	date := r.PathValue("date")
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeError(w, 400, "date must be YYYY-MM-DD")
+		return
+	}
+	var timezone string
+	if err := s.db.QueryRow(r.Context(), `SELECT home_terminal_timezone FROM drivers WHERE id=$1 AND active=true`, id).Scan(&timezone); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 404, "driver not found")
+		} else {
+			writeError(w, 500, err.Error())
+		}
+		return
+	}
+	if err := s.ensureDriverDayContinuity(r.Context(), id, date, timezone); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	segs, err := scanSegments(r.Context(), s.db, id, date)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	segs = s.enrichSegmentEpisodes(r.Context(), id, date, timezone, segs)
+
+	events := []EventResponse{}
+	erows, err := s.db.Query(r.Context(), `
+SELECT id::text, minute, event_time, event_type, duty_status, note, location_text,
+       COALESCE(latitude,0), COALESCE(longitude,0), COALESCE(gps_accuracy_meters,0), odometer_miles,
+       engine_hours, duration_seconds, origin, diagnostic, violation, edited, edit_reason, co_driver, revision
+FROM eld_events WHERE driver_id=$1 AND log_date=$2 ORDER BY minute,id`, id, date)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	for erows.Next() {
+		var x EventResponse
+		var et *time.Time
+		if err := erows.Scan(&x.ID, &x.Minute, &et, &x.EventType, &x.DutyStatus, &x.Note,
+			&x.LocationText, &x.Latitude, &x.Longitude, &x.GPSAccuracyMeters, &x.OdometerMiles, &x.EngineHours, &x.DurationSeconds, &x.Origin,
+			&x.Diagnostic, &x.Violation, &x.Edited, &x.EditReason, &x.CoDriver, &x.Revision); err != nil {
+			erows.Close()
+			writeError(w, 500, err.Error())
+			return
+		}
+		x.EventTime = timeString(et)
+		events = append(events, x)
+	}
+	erows.Close()
+
+	history := []LogEditHistoryResponse{}
+	hrows, err := s.db.Query(r.Context(), `
+SELECT id::text, action, reason, operator_name, start_minute, end_minute, created_at, undone_at, undone_by
+FROM log_edit_batches WHERE driver_id=$1 AND log_date=$2 ORDER BY created_at DESC LIMIT 40`, id, date)
+	if err == nil {
+		for hrows.Next() {
+			var h LogEditHistoryResponse
+			var created time.Time
+			var undone *time.Time
+			if err := hrows.Scan(&h.ID, &h.Action, &h.Reason, &h.Operator, &h.StartMinute, &h.EndMinute, &created, &undone, &h.UndoneBy); err != nil {
+				break
+			}
+			h.CreatedAt = created.UTC().Format(time.RFC3339)
+			h.UndoneAt = timeString(undone)
+			history = append(history, h)
+		}
+		hrows.Close()
+	}
+
+	payload := map[string]any{
+		"driver_id":    id,
+		"date":         date,
+		"timezone":     timezone,
+		"segments":     segs,
+		"events":       events,
+		"edit_history": history,
+	}
+	if h, err := s.queryHOS(r.Context(), id); err == nil {
+		payload["hos"] = h
+	}
+	writeJSON(w, 200, payload)
+}
+
+func normalizeStatus(v string) (string, bool) {
+	v = strings.ToUpper(strings.TrimSpace(v))
+	switch v {
+	case "OFF", "OFFDUTY", "OFF DUTY":
+		return "OFF", true
+	case "SB", "SLEEPER", "SLEEPER BERTH":
+		return "SB", true
+	case "DR", "DRIVING", "D":
+		return "DR", true
+	case "ON", "ONDUTY", "ON DUTY":
+		return "ON", true
+	default:
+		return "", false
+	}
+}
+
+func (s *Server) handleDriverLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Username = strings.TrimSpace(in.Username)
+	if in.Username == "" || in.Password == "" {
+		writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+	var driverID, passwordHash string
+	err := s.db.QueryRow(r.Context(), `SELECT id,password_hash FROM drivers WHERE lower(username)=lower($1) AND active=true`, in.Username).Scan(&driverID, &passwordHash)
+	if err != nil || passwordHash == "" || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+		writeError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	token, tokenHash, err := generateSessionToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create session")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(30 * 24 * time.Hour)
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	_, _ = tx.Exec(r.Context(), `DELETE FROM driver_sessions WHERE expires_at<=now()`)
+	if _, err = tx.Exec(r.Context(), `INSERT INTO driver_sessions(token_hash,driver_id,expires_at) VALUES($1,$2,$3)`, tokenHash, driverID, expiresAt); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_at": expiresAt.Format(time.RFC3339), "driver": d})
+}
+
+func (s *Server) handleDriverMe(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "driver session is not valid")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"driver": d})
+}
+
+func (s *Server) handleDriverSelfHOS(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	r.SetPathValue("id", driverID)
+	s.handleDriverHOS(w, r)
+}
+
+func (s *Server) handleDriverSelfLog(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	r.SetPathValue("id", driverID)
+	s.handleDriverLog(w, r)
+}
+
+func (s *Server) handleDriverSelfStatus(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	var in struct {
+		ClientEventID  string   `json:"client_event_id"`
+		RecordedAt     string   `json:"recorded_at"`
+		SpeedMPS       float64  `json:"speed_mps"`
+		Status         string   `json:"status"`
+		Note           string   `json:"note"`
+		LocationText   string   `json:"location_text"`
+		Latitude       *float64 `json:"latitude"`
+		Longitude      *float64 `json:"longitude"`
+		AccuracyMeters float64  `json:"accuracy_meters"`
+		EngineHours    float64  `json:"engine_hours"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	status, ok := normalizeStatus(in.Status)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid duty status")
+		return
+	}
+	if status == "DR" {
+		writeError(w, http.StatusBadRequest, "Driving is automatic and cannot be selected manually")
+		return
+	}
+	in.Note = strings.TrimSpace(in.Note)
+	if status == "ON" && in.Note == "" {
+		writeError(w, http.StatusBadRequest, "On Duty requires a note")
+		return
+	}
+	if in.Latitude == nil || in.Longitude == nil || !validCoordinates(*in.Latitude, *in.Longitude) {
+		writeError(w, http.StatusBadRequest, "current device location is required for a status change")
+		return
+	}
+	at := time.Now().UTC()
+	if in.RecordedAt != "" {
+		t, e := time.Parse(time.RFC3339Nano, in.RecordedAt)
+		if e != nil || t.After(at.Add(time.Minute)) {
+			writeError(w, 400, "invalid recorded_at")
+			return
+		}
+		at = t
+	}
+	// A stopped driver may choose the post-drive status during the one-minute DR hold.
+	// While the truck is still moving, manual status changes remain blocked.
+	if in.Note == "" {
+		in.Note = map[string]string{"OFF": "Off Duty", "SB": "Sleeper Berth"}[status]
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	duplicate, err := acceptMobileEvent(r.Context(), tx, driverID, in.ClientEventID, "status", at)
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if duplicate {
+		writeJSON(w, 200, map[string]any{"ok": true, "duplicate": true})
+		return
+	}
+	var activeCount int
+	var liveSpeed float64
+	var since *time.Time
+	_ = tx.QueryRow(r.Context(), `SELECT gps_speed_mps,status_since FROM driver_live_state WHERE driver_id=$1 FOR UPDATE`, driverID).Scan(&liveSpeed, &since)
+	if since != nil && at.Before(*since) {
+		writeError(w, 409, "Offline status predates a newer status change; review required")
+		return
+	}
+	if err = tx.QueryRow(r.Context(), `SELECT count(*)::int FROM drive_sessions WHERE driver_id=$1 AND state='active'`, driverID).Scan(&activeCount); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if activeCount > 0 && (liveSpeed > autoDriveStopSpeedMPS || in.SpeedMPS > autoDriveStopSpeedMPS) {
+		writeError(w, 409, "Driving is active while the vehicle is moving")
+		return
+	}
+
+	if activeCount > 0 {
+		if _, err = s.finishActiveDriveSessionTx(r.Context(), tx, driverID, at, *in.Latitude, *in.Longitude, in.AccuracyMeters, liveSpeed, strings.TrimSpace(in.LocationText)); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+	logDate, minute, second, _, err := s.transitionDriverStatusTx(r.Context(), tx, driverID, status, in.Note, "DriverApp", strings.TrimSpace(in.LocationText), *in.Latitude, *in.Longitude, 0, in.AccuracyMeters, 0, at, false)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.recalcHOSFromSegments(r.Context(), driverID)
+	d, err := s.queryDriver(r.Context(), driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "driver": d, "log_date": logDate, "minute": minute, "second": second})
+}
+
+func (s *Server) handleDriverHeartbeat(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	var in struct {
+		LocationText *string  `json:"location_text"`
+		Latitude     *float64 `json:"latitude"`
+		Longitude    *float64 `json:"longitude"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in)
+	}
+	current, err := s.queryLiveState(r.Context(), driverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		current = LiveStateResponse{DriverID: driverID, Status: "OFF"}
+	} else if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if in.LocationText != nil {
+		current.LocationText = strings.TrimSpace(*in.LocationText)
+	}
+	if in.Latitude != nil {
+		current.Latitude = *in.Latitude
+	}
+	if in.Longitude != nil {
+		current.Longitude = *in.Longitude
+	}
+	_, err = s.db.Exec(r.Context(), `
+INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
+VALUES($1,$2,true,$3,$4,$5,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET connected=true,location_text=EXCLUDED.location_text,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,revision=driver_live_state.revision+1`,
+		driverID, current.Status, current.LocationText, current.Latitude, current.Longitude)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "connected": true})
+}
+
+func ringtoneAllowed(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "phone_ring", "rooster", "siren", "alarm":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleDriverAlarms(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text,driver_id,title,message,ringtone,created_at,delivered_at,acknowledged_at
+FROM driver_alarms
+WHERE driver_id=$1 AND delivered_at IS NULL
+ORDER BY created_at ASC LIMIT 20`, driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []AlarmResponse{}
+	for rows.Next() {
+		var a AlarmResponse
+		var created time.Time
+		var delivered, ack *time.Time
+		if err := rows.Scan(&a.ID, &a.DriverID, &a.Title, &a.Message, &a.Ringtone, &created, &delivered, &ack); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		a.CreatedAt = created.UTC().Format(time.RFC3339)
+		a.DeliveredAt = timeString(delivered)
+		a.AcknowledgedAt = timeString(ack)
+		out = append(out, a)
+	}
+	writeJSON(w, 200, map[string]any{"alarms": out})
+}
+
+func (s *Server) handleDriverAlarmDelivered(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	id := strings.TrimSpace(r.PathValue("id"))
+	ct, err := s.db.Exec(r.Context(), `UPDATE driver_alarms SET delivered_at=COALESCE(delivered_at,now()) WHERE id=$1::uuid AND driver_id=$2`, id, driverID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeError(w, 404, "alarm not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAdminDriverAlarm(w http.ResponseWriter, r *http.Request) {
+	driverID := strings.TrimSpace(r.PathValue("id"))
+	var in struct {
+		Title    string `json:"title"`
+		Message  string `json:"message"`
+		Ringtone string `json:"ringtone"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	in.Title = strings.TrimSpace(in.Title)
+	in.Message = strings.TrimSpace(in.Message)
+	in.Ringtone = strings.ToLower(strings.TrimSpace(in.Ringtone))
+	if in.Title == "" {
+		in.Title = "NEKSUS alert"
+	}
+	if in.Message == "" {
+		writeError(w, 400, "alarm message is required")
+		return
+	}
+	if len(in.Title) > 80 || len(in.Message) > 500 {
+		writeError(w, 400, "alarm title or message is too long")
+		return
+	}
+	if !ringtoneAllowed(in.Ringtone) {
+		writeError(w, 400, "ringtone must be phone_ring, rooster, siren or alarm")
+		return
+	}
+	var exists bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE id=$1 AND active=true)`, driverID).Scan(&exists); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if !exists {
+		writeError(w, 404, "driver not found")
+		return
+	}
+	var a AlarmResponse
+	var created time.Time
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO driver_alarms(driver_id,title,message,ringtone)
+VALUES($1,$2,$3,$4)
+RETURNING id::text,driver_id,title,message,ringtone,created_at`, driverID, in.Title, in.Message, in.Ringtone).Scan(&a.ID, &a.DriverID, &a.Title, &a.Message, &a.Ringtone, &created)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	a.CreatedAt = created.UTC().Format(time.RFC3339)
+	writeJSON(w, http.StatusCreated, a)
+}
+
+func (s *Server) handleDriverLogout(w http.ResponseWriter, r *http.Request) {
+	driverID, _ := r.Context().Value(driverIDContextKey).(string)
+	token := bearer(r)
+	if token != "" {
+		hash := sha256.Sum256([]byte(token))
+		_, _ = s.db.Exec(r.Context(), `DELETE FROM driver_sessions WHERE token_hash=$1`, hash[:])
+	}
+	if driverID != "" {
+		_, _ = s.db.Exec(r.Context(), `UPDATE driver_live_state SET connected=false,revision=revision+1 WHERE driver_id=$1`, driverID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminSession(w http.ResponseWriter, r *http.Request) {
+	i := identityFromContext(r.Context())
+	if i == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": "admin", "service": "neksus-api"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": i.Role, "username": i.Username, "full_name": i.FullName, "all_companies": i.AllCompanies, "service": "neksus-api"})
+}
+
+func (s *Server) handleAdminDriver(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID                string `json:"id"`
+		Username          string `json:"username"`
+		FirstName         string `json:"first_name"`
+		LastName          string `json:"last_name"`
+		Email             string `json:"email"`
+		Phone             string `json:"phone"`
+		Password          string `json:"password"`
+		LicenseIssueState string `json:"license_issue_state"`
+		LicenseNumber     string `json:"license_number"`
+		Vehicle           string `json:"vehicle"`
+		VehicleID         string `json:"vehicle_id"`
+		CompanyID         string `json:"company_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	in.ID = strings.TrimSpace(in.ID)
+	in.Username = strings.TrimSpace(in.Username)
+	in.FirstName = strings.TrimSpace(in.FirstName)
+	in.LastName = strings.TrimSpace(in.LastName)
+	in.Email = strings.TrimSpace(in.Email)
+	in.Phone = strings.TrimSpace(in.Phone)
+	in.LicenseIssueState = strings.ToUpper(strings.TrimSpace(in.LicenseIssueState))
+	in.LicenseNumber = strings.TrimSpace(in.LicenseNumber)
+	in.Vehicle = strings.TrimSpace(in.Vehicle)
+	in.VehicleID = strings.TrimSpace(in.VehicleID)
+	in.CompanyID = strings.TrimSpace(in.CompanyID)
+	if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(in.CompanyID) {
+		writeError(w, http.StatusForbidden, "company is outside your access")
+		return
+	}
+	creating := in.ID == ""
+	if !creating {
+		var existingCompany string
+		if err := s.db.QueryRow(r.Context(), `SELECT COALESCE(company_id::text,'') FROM drivers WHERE id=$1 AND active=true`, in.ID).Scan(&existingCompany); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 404, "driver not found")
+			} else {
+				writeError(w, 500, err.Error())
+			}
+			return
+		}
+		if i := identityFromContext(r.Context()); i != nil && !i.companyAllowed(existingCompany) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+	}
+	if !driverUsernamePattern.MatchString(in.Username) {
+		writeError(w, 400, "username must be 4-40 characters using letters, numbers, dot, underscore or dash")
+		return
+	}
+	if in.FirstName == "" || in.LastName == "" {
+		writeError(w, 400, "first name and last name are required")
+		return
+	}
+	if in.CompanyID == "" {
+		writeError(w, 400, "select an existing company")
+		return
+	}
+	if len(in.LicenseIssueState) != 2 || in.LicenseNumber == "" {
+		writeError(w, 400, "driver license issue state and license number are required")
+		return
+	}
+	if len(in.Password) > 0 && (len(in.Password) < 6 || len(in.Password) > 24) {
+		writeError(w, 400, "password must contain 6-24 characters")
+		return
+	}
+	if creating && in.Password == "" {
+		writeError(w, 400, "password is required for a new driver")
+		return
+	}
+	if creating {
+		var err error
+		in.ID, err = generateDriverID()
+		if err != nil {
+			writeError(w, 500, "could not generate driver id")
+			return
+		}
+	}
+	var usernameTaken bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE lower(username)=lower($1) AND id<>$2)`, in.Username, in.ID).Scan(&usernameTaken); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if usernameTaken {
+		writeError(w, http.StatusConflict, "username is already in use")
+		return
+	}
+	passwordHash := ""
+	if in.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeError(w, 500, "could not secure password")
+			return
+		}
+		passwordHash = string(hash)
+	}
+	fullName := strings.TrimSpace(in.FirstName + " " + in.LastName)
+	var companyID, carrier string
+	if err := s.db.QueryRow(r.Context(), `SELECT id::text,name FROM companies WHERE id=$1::uuid`, in.CompanyID).Scan(&companyID, &carrier); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 400, "selected company does not exist")
+		} else {
+			writeError(w, 500, err.Error())
+		}
+		return
+	}
+	vehicleID := ""
+	vehicleUnit := ""
+	vehicleType := "TRACTOR"
+	if in.VehicleID != "" || in.Vehicle != "" {
+		query := `SELECT id::text,unit_number,vehicle_type FROM vehicles WHERE active=true AND company_id=$1::uuid AND `
+		args := []any{companyID}
+		if in.VehicleID != "" {
+			query += `id=$2::uuid`
+			args = append(args, in.VehicleID)
+		} else {
+			query += `unit_number=$2`
+			args = append(args, in.Vehicle)
+		}
+		if err := s.db.QueryRow(r.Context(), query, args...).Scan(&vehicleID, &vehicleUnit, &vehicleType); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 400, "selected vehicle does not belong to this company")
+			} else {
+				writeError(w, 500, err.Error())
+			}
+			return
+		}
+		var assignedTo string
+		err := s.db.QueryRow(r.Context(), `SELECT id FROM drivers WHERE vehicle_id=$1::uuid AND active=true AND id<>$2 LIMIT 1`, vehicleID, in.ID).Scan(&assignedTo)
+		if err == nil {
+			writeError(w, 409, "vehicle is already assigned to another driver")
+			return
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	_, err = tx.Exec(r.Context(), `
+INSERT INTO drivers(id,username,first_name,last_name,full_name,password_hash,license_issue_state,license_number,company_id,carrier,phone,email,truck_unit,vehicle_id,vehicle_type,active)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,NULLIF($14,'')::uuid,$15,true)
+ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
+ full_name=EXCLUDED.full_name, password_hash=CASE WHEN EXCLUDED.password_hash<>'' THEN EXCLUDED.password_hash ELSE drivers.password_hash END,
+ license_issue_state=EXCLUDED.license_issue_state, license_number=EXCLUDED.license_number,
+ company_id=EXCLUDED.company_id, carrier=EXCLUDED.carrier, phone=EXCLUDED.phone, email=EXCLUDED.email,
+ truck_unit=EXCLUDED.truck_unit, vehicle_id=EXCLUDED.vehicle_id, vehicle_type=EXCLUDED.vehicle_type, active=true`, in.ID, in.Username, in.FirstName, in.LastName, fullName, passwordHash,
+		in.LicenseIssueState, in.LicenseNumber, companyID, carrier, in.Phone, in.Email, vehicleUnit, vehicleID, vehicleType)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_, err = tx.Exec(r.Context(), `
+INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
+VALUES($1,'OFF',false,'',0,0,now(),1)
+ON CONFLICT(driver_id) DO NOTHING`, in.ID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_, err = tx.Exec(r.Context(), `
+INSERT INTO driver_hos_current(driver_id,break_remaining_seconds,drive_remaining_seconds,shift_remaining_seconds,cycle_remaining_seconds,revision)
+VALUES($1,28800,39600,50400,252000,1)
+ON CONFLICT(driver_id) DO NOTHING`, in.ID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if creating {
+		loc, _ := time.LoadLocation("America/Chicago")
+		if loc == nil {
+			loc = time.UTC
+		}
+		today := time.Now().In(loc)
+		historyStart := today.AddDate(0, 0, -7)
+		historyStartSecond := historyStart.Hour()*3600 + historyStart.Minute()*60 + historyStart.Second()
+		for dayCursor := time.Date(historyStart.Year(), historyStart.Month(), historyStart.Day(), 0, 0, 0, 0, loc); !dayCursor.After(time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, loc)); dayCursor = dayCursor.AddDate(0, 0, 1) {
+			day := dayCursor.Format("2006-01-02")
+			startSecond := 0
+			startMinute := 0
+			if day == historyStart.Format("2006-01-02") {
+				startSecond = historyStartSecond
+				startMinute = historyStartSecond / 60
+			}
+			if day == today.Format("2006-01-02") {
+				_, err = tx.Exec(r.Context(), `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin)
+SELECT $1,$2,$3,$4,NULL,NULL,'OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day, startMinute, startSecond)
+			} else {
+				_, err = tx.Exec(r.Context(), `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,note,origin)
+SELECT $1,$2,$3,$4,1440,86400,'OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM duty_segments WHERE driver_id=$1 AND log_date=$2)`, in.ID, day, startMinute, startSecond)
+			}
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		}
+		oldestDay := historyStart.Format("2006-01-02")
+		oldestMinute := historyStartSecond / 60
+		_, err = tx.Exec(r.Context(), `
+INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,origin)
+SELECT $1,$2,$3,NULL,'duty_status','OFF','','System'
+WHERE NOT EXISTS (SELECT 1 FROM eld_events WHERE driver_id=$1 AND log_date=$2 AND minute=$3 AND duty_status='OFF')`, in.ID, oldestDay, oldestMinute)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	d, err := s.queryDriver(r.Context(), in.ID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	status := http.StatusOK
+	if creating {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, d)
+}
+
+func (s *Server) handleAdminTripInfo(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "driver id is required")
+		return
+	}
+	var in struct {
+		Trailer          string `json:"trailer"`
+		ShippingDocument string `json:"shipping_document"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Trailer = strings.TrimSpace(in.Trailer)
+	in.ShippingDocument = strings.TrimSpace(in.ShippingDocument)
+	if len(in.Trailer) > 40 || len(in.ShippingDocument) > 80 {
+		writeError(w, http.StatusBadRequest, "trip information is too long")
+		return
+	}
+	cmd, err := s.db.Exec(r.Context(), `UPDATE drivers SET trailer_number=$2, shipping_document=$3, updated_at=now() WHERE id=$1 AND active=true`, id, in.Trailer, in.ShippingDocument)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if cmd.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "driver not found")
+		return
+	}
+	d, err := s.queryDriver(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+func (s *Server) handleAdminDriverDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "driver id is required")
+		return
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	ct, err := tx.Exec(r.Context(), `UPDATE drivers SET active=false,vehicle_id=NULL,truck_unit='',updated_at=now() WHERE id=$1 AND active=true`, id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeError(w, 404, "driver not found")
+		return
+	}
+	_, _ = tx.Exec(r.Context(), `DELETE FROM driver_sessions WHERE driver_id=$1`, id)
+	_, _ = tx.Exec(r.Context(), `UPDATE driver_live_state SET connected=false,revision=revision+1 WHERE driver_id=$1`, id)
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminLive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		Status       string   `json:"status"`
+		Connected    *bool    `json:"connected"`
+		LocationText *string  `json:"location_text"`
+		Latitude     *float64 `json:"latitude"`
+		Longitude    *float64 `json:"longitude"`
+		Truck        *string  `json:"truck"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	var exists bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM drivers WHERE id=$1)`, id).Scan(&exists); err != nil || !exists {
+		writeError(w, 404, "driver not found")
+		return
+	}
+	if in.Truck != nil {
+		unit := strings.TrimSpace(*in.Truck)
+		if unit == "" {
+			if _, err := s.db.Exec(r.Context(), `UPDATE drivers SET truck_unit='',vehicle_id=NULL,updated_at=now() WHERE id=$1`, id); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		} else {
+			var vehicleID, vehicleType string
+			err := s.db.QueryRow(r.Context(), `SELECT v.id::text,v.vehicle_type FROM vehicles v JOIN drivers d ON d.company_id=v.company_id WHERE d.id=$1 AND d.active=true AND v.active=true AND v.unit_number=$2`, id, unit).Scan(&vehicleID, &vehicleType)
+			if err != nil {
+				writeError(w, 400, "vehicle must belong to the driver's company")
+				return
+			}
+			var other string
+			err = s.db.QueryRow(r.Context(), `SELECT id FROM drivers WHERE vehicle_id=$1::uuid AND active=true AND id<>$2 LIMIT 1`, vehicleID, id).Scan(&other)
+			if err == nil {
+				writeError(w, 409, "vehicle is already assigned to another driver")
+				return
+			}
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, 500, err.Error())
+				return
+			}
+			if _, err := s.db.Exec(r.Context(), `UPDATE drivers SET truck_unit=$2,vehicle_id=$3::uuid,vehicle_type=$4,updated_at=now() WHERE id=$1`, id, unit, vehicleID, vehicleType); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+		}
+	}
+	current, err := s.queryLiveState(r.Context(), id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		current = LiveStateResponse{DriverID: id, Status: "OFF"}
+	} else if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	status := current.Status
+	if strings.TrimSpace(in.Status) != "" {
+		var ok bool
+		status, ok = normalizeStatus(in.Status)
+		if !ok {
+			writeError(w, 400, "invalid status")
+			return
+		}
+	}
+	connected := current.Connected
+	if in.Connected != nil {
+		connected = *in.Connected
+	}
+	location := current.LocationText
+	if in.LocationText != nil {
+		location = *in.LocationText
+	}
+	lat := current.Latitude
+	if in.Latitude != nil {
+		lat = *in.Latitude
+	}
+	lon := current.Longitude
+	if in.Longitude != nil {
+		lon = *in.Longitude
+	}
+	_, err = s.db.Exec(r.Context(), `
+INSERT INTO driver_live_state(driver_id,duty_status,connected,location_text,latitude,longitude,status_since,revision)
+VALUES($1,$2,$3,$4,$5,$6,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET duty_status=EXCLUDED.duty_status, connected=EXCLUDED.connected,
+ location_text=EXCLUDED.location_text, latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
+ status_since=CASE WHEN driver_live_state.duty_status<>EXCLUDED.duty_status THEN now() ELSE driver_live_state.status_since END,
+ revision=driver_live_state.revision+1`, id, status, connected, location, lat, lon)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	x, err := s.queryLiveState(r.Context(), id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, x)
+}
+
+func (s *Server) handleAdminHOS(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		BreakRemainingSeconds int     `json:"break_remaining_seconds"`
+		DriveRemainingSeconds int     `json:"drive_remaining_seconds"`
+		ShiftRemainingSeconds int     `json:"shift_remaining_seconds"`
+		CycleRemainingSeconds int     `json:"cycle_remaining_seconds"`
+		ShiftStartedAt        *string `json:"shift_started_at"`
+		Last10HResetAt        *string `json:"last_10h_reset_at"`
+		Last34HResetAt        *string `json:"last_34h_reset_at"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	for _, v := range []int{in.BreakRemainingSeconds, in.DriveRemainingSeconds, in.ShiftRemainingSeconds, in.CycleRemainingSeconds} {
+		if v < 0 {
+			writeError(w, 400, "HOS remaining values cannot be negative")
+			return
+		}
+	}
+	parseOptional := func(v *string) (*time.Time, error) {
+		if v == nil || strings.TrimSpace(*v) == "" {
+			return nil, nil
+		}
+		t, err := time.Parse(time.RFC3339, strings.TrimSpace(*v))
+		if err != nil {
+			return nil, err
+		}
+		return &t, nil
+	}
+	shift, err := parseOptional(in.ShiftStartedAt)
+	if err != nil {
+		writeError(w, 400, "invalid shift_started_at")
+		return
+	}
+	r10, err := parseOptional(in.Last10HResetAt)
+	if err != nil {
+		writeError(w, 400, "invalid last_10h_reset_at")
+		return
+	}
+	r34, err := parseOptional(in.Last34HResetAt)
+	if err != nil {
+		writeError(w, 400, "invalid last_34h_reset_at")
+		return
+	}
+	ct, err := s.db.Exec(r.Context(), `
+INSERT INTO driver_hos_current(driver_id,break_remaining_seconds,drive_remaining_seconds,shift_remaining_seconds,cycle_remaining_seconds,shift_started_at,last_10h_reset_at,last_34h_reset_at,calculated_at,revision)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET break_remaining_seconds=EXCLUDED.break_remaining_seconds,
+ drive_remaining_seconds=EXCLUDED.drive_remaining_seconds, shift_remaining_seconds=EXCLUDED.shift_remaining_seconds,
+ cycle_remaining_seconds=EXCLUDED.cycle_remaining_seconds, shift_started_at=EXCLUDED.shift_started_at,
+ last_10h_reset_at=EXCLUDED.last_10h_reset_at, last_34h_reset_at=EXCLUDED.last_34h_reset_at,
+ calculated_at=now(), revision=driver_hos_current.revision+1`, id, in.BreakRemainingSeconds, in.DriveRemainingSeconds,
+		in.ShiftRemainingSeconds, in.CycleRemainingSeconds, shift, r10, r34)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeError(w, 404, "driver not found")
+		return
+	}
+	h, err := s.queryHOS(r.Context(), id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, h)
+}
+
+type rangeEditInput struct {
+	StartMinute      int     `json:"start_minute"`
+	StartSecond      int     `json:"start_second"`
+	EndMinute        int     `json:"end_minute"`
+	Status           string  `json:"status"`
+	SpecialStatus    string  `json:"special_status"`
+	Note             string  `json:"note"`
+	Reason           string  `json:"reason"`
+	Operator         string  `json:"operator"`
+	LocationText     string  `json:"location_text"`
+	OdometerMiles    float64 `json:"odometer_miles"`
+	EngineHours      float64 `json:"engine_hours"`
+	TrailerNumber    string  `json:"trailer_number"`
+	ShippingDocument string  `json:"shipping_document"`
+}
+
+func intPointer(v int) *int { return &v }
+
+func effectiveStartSecond(x SegmentResponse) int {
+	if x.StartSecond > 0 || x.StartMinute == 0 {
+		return x.StartSecond
+	}
+	return x.StartMinute * 60
+}
+
+func effectiveEndSecond(x SegmentResponse, end *int) *int {
+	if end == nil {
+		return nil
+	}
+	if x.EndSecond != nil {
+		v := *x.EndSecond
+		return &v
+	}
+	v := *end * 60
+	return &v
+}
+
+func copySegment(x SegmentResponse) SegmentResponse {
+	y := x
+	if x.EndMinute != nil {
+		v := *x.EndMinute
+		y.EndMinute = &v
+	}
+	if x.EndSecond != nil {
+		v := *x.EndSecond
+		y.EndSecond = &v
+	}
+	return y
+}
+
+func (s *Server) scanSegmentsTx(ctx context.Context, tx pgx.Tx, id, date string) ([]SegmentResponse, error) {
+	rows, err := tx.Query(ctx, `
+SELECT id::text, start_minute, COALESCE(start_second,start_minute*60), end_minute,
+       CASE WHEN end_minute IS NULL THEN NULL ELSE COALESCE(end_second,end_minute*60) END,
+       duty_status, special_status, note, origin, edited, revision,
+       location_text, odometer_miles, engine_hours, trailer_number, shipping_document, edit_reason
+FROM duty_segments WHERE driver_id=$1 AND log_date=$2 ORDER BY COALESCE(start_second,start_minute*60),id FOR UPDATE`, id, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SegmentResponse{}
+	for rows.Next() {
+		var x SegmentResponse
+		if err := rows.Scan(&x.ID, &x.StartMinute, &x.StartSecond, &x.EndMinute, &x.EndSecond, &x.DutyStatus, &x.SpecialStatus,
+			&x.Note, &x.Origin, &x.Edited, &x.Revision, &x.LocationText, &x.OdometerMiles,
+			&x.EngineHours, &x.TrailerNumber, &x.ShippingDocument, &x.EditReason); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Server) driverDayLimit(ctx context.Context, id, date string) (string, int, bool, error) {
+	var timezone string
+	if err := s.db.QueryRow(ctx, `SELECT home_terminal_timezone FROM drivers WHERE id=$1 AND active=true`, id).Scan(&timezone); err != nil {
+		return "", 0, false, err
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	requested, err := time.ParseInLocation("2006-01-02", date, loc)
+	if err != nil {
+		return timezone, 0, false, err
+	}
+	now := time.Now().In(loc)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	if requested.After(today) {
+		return timezone, 0, false, errors.New("cannot edit a future log date")
+	}
+	current := requested.Equal(today)
+	if current {
+		minute := now.Hour()*60 + now.Minute()
+		if minute < 1 {
+			minute = 1
+		}
+		return timezone, minute, true, nil
+	}
+	return timezone, 1440, false, nil
+}
+
+func canonicalSegments(in []SegmentResponse, dayEnd int) []SegmentResponse {
+	if dayEnd < 1 {
+		dayEnd = 1
+	}
+	out := []SegmentResponse{}
+	cursor := 0
+	for _, original := range in {
+		x := copySegment(original)
+		start := x.StartMinute
+		end := dayEnd
+		if x.EndMinute != nil {
+			end = *x.EndMinute
+		}
+		if start < 0 {
+			start = 0
+		}
+		if start > dayEnd {
+			start = dayEnd
+		}
+		if end < 0 {
+			end = 0
+		}
+		if end > dayEnd {
+			end = dayEnd
+		}
+		if start > cursor {
+			out = append(out, SegmentResponse{StartMinute: cursor, StartSecond: cursor * 60, EndMinute: intPointer(start), EndSecond: intPointer(start * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+			cursor = start
+		}
+		if start < cursor {
+			start = cursor
+		}
+		if end <= start {
+			continue
+		}
+		x.StartMinute = start
+		x.StartSecond = start * 60
+		x.EndMinute = intPointer(end)
+		x.EndSecond = intPointer(end * 60)
+		out = append(out, x)
+		cursor = end
+		if cursor >= dayEnd {
+			break
+		}
+	}
+	if cursor < dayEnd {
+		out = append(out, SegmentResponse{StartMinute: cursor, StartSecond: cursor * 60, EndMinute: intPointer(dayEnd), EndSecond: intPointer(dayEnd * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+	}
+	if len(out) == 0 {
+		out = append(out, SegmentResponse{StartMinute: 0, StartSecond: 0, EndMinute: intPointer(dayEnd), EndSecond: intPointer(dayEnd * 60), DutyStatus: "OFF", Note: "Continuity filler", Origin: "System"})
+	}
+	return out
+}
+
+func sameEditableSegment(a, b SegmentResponse) bool {
+	return a.DutyStatus == b.DutyStatus && a.SpecialStatus == b.SpecialStatus && a.Note == b.Note &&
+		a.Origin == b.Origin && a.LocationText == b.LocationText && a.TrailerNumber == b.TrailerNumber &&
+		a.ShippingDocument == b.ShippingDocument && a.EditReason == b.EditReason && a.Edited == b.Edited
+}
+
+func mergeAdjacentSegments(in []SegmentResponse) []SegmentResponse {
+	out := []SegmentResponse{}
+	for _, x := range in {
+		if len(out) == 0 {
+			out = append(out, x)
+			continue
+		}
+		prev := &out[len(out)-1]
+		prevEnd := effectiveEndSecond(*prev, prev.EndMinute)
+		contiguous := prevEnd != nil && *prevEnd == effectiveStartSecond(x)
+		sameDuty := prev.DutyStatus == x.DutyStatus && prev.SpecialStatus == x.SpecialStatus
+		adminMerge := sameDuty && (prev.Edited || x.Edited || prev.Origin == "Admin" || x.Origin == "Admin")
+		if contiguous && (sameEditableSegment(*prev, x) || adminMerge) {
+			prev.EndMinute = x.EndMinute
+			prev.EndSecond = x.EndSecond
+			prev.Edited = prev.Edited || x.Edited
+			if prev.Origin == "" || x.Origin == "Admin" {
+				prev.Origin = x.Origin
+			}
+			if prev.Note == "" {
+				prev.Note = x.Note
+			}
+			if prev.LocationText == "" {
+				prev.LocationText = x.LocationText
+			}
+			if prev.TrailerNumber == "" {
+				prev.TrailerNumber = x.TrailerNumber
+			}
+			if prev.ShippingDocument == "" {
+				prev.ShippingDocument = x.ShippingDocument
+			}
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
+func applyRangeOverlay(base []SegmentResponse, in rangeEditInput, duty, special string) []SegmentResponse {
+	out := []SegmentResponse{}
+	inserted := false
+	makeReplacement := func() SegmentResponse {
+		return SegmentResponse{
+			StartMinute: in.StartMinute, StartSecond: in.StartMinute * 60, EndMinute: intPointer(in.EndMinute), EndSecond: intPointer(in.EndMinute * 60), DutyStatus: duty, SpecialStatus: special,
+			Note: in.Note, Origin: "Admin", Edited: true, Revision: 1, LocationText: in.LocationText,
+			OdometerMiles: in.OdometerMiles, EngineHours: in.EngineHours, TrailerNumber: in.TrailerNumber,
+			ShippingDocument: in.ShippingDocument, EditReason: in.Reason,
+		}
+	}
+	for _, original := range base {
+		x := copySegment(original)
+		end := *x.EndMinute
+		if end <= in.StartMinute {
+			out = append(out, x)
+			continue
+		}
+		if x.StartMinute >= in.EndMinute {
+			if !inserted {
+				out = append(out, makeReplacement())
+				inserted = true
+			}
+			out = append(out, x)
+			continue
+		}
+		if x.StartMinute < in.StartMinute {
+			prefix := copySegment(x)
+			prefix.EndMinute = intPointer(in.StartMinute)
+			prefix.EndSecond = intPointer(in.StartMinute * 60)
+			out = append(out, prefix)
+		}
+		if !inserted {
+			out = append(out, makeReplacement())
+			inserted = true
+		}
+		if end > in.EndMinute {
+			suffix := copySegment(x)
+			suffix.ID = ""
+			suffix.StartMinute = in.EndMinute
+			suffix.StartSecond = in.EndMinute * 60
+			suffix.EndMinute = intPointer(end)
+			out = append(out, suffix)
+		}
+	}
+	if !inserted {
+		out = append(out, makeReplacement())
+	}
+	return mergeAdjacentSegments(out)
+}
+
+func (s *Server) replaceDaySegmentsTx(ctx context.Context, tx pgx.Tx, driverID, date string, segs []SegmentResponse, keepLastOpen bool) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM duty_segments WHERE driver_id=$1 AND log_date=$2`, driverID, date); err != nil {
+		return err
+	}
+	for i, x := range segs {
+		var end *int = x.EndMinute
+		if keepLastOpen && i == len(segs)-1 {
+			end = nil
+		}
+		if x.Origin == "" {
+			x.Origin = "Admin"
+		}
+		if x.ID != "" {
+			_, err := tx.Exec(ctx, `
+INSERT INTO duty_segments(id,driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,special_status,note,origin,edited,revision,
+ location_text,odometer_miles,engine_hours,trailer_number,shipping_document,edit_reason)
+VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,GREATEST($13,1),$14,$15,$16,$17,$18,$19)`,
+				x.ID, driverID, date, x.StartMinute, effectiveStartSecond(x), end, effectiveEndSecond(x, end), x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
+				x.Revision, x.LocationText, x.OdometerMiles, x.EngineHours, x.TrailerNumber, x.ShippingDocument, x.EditReason)
+			if err != nil {
+				return err
+			}
+		} else {
+			_, err := tx.Exec(ctx, `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,start_second,end_minute,end_second,duty_status,special_status,note,origin,edited,revision,
+ location_text,odometer_miles,engine_hours,trailer_number,shipping_document,edit_reason)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,GREATEST($12,1),$13,$14,$15,$16,$17,$18)`,
+				driverID, date, x.StartMinute, effectiveStartSecond(x), end, effectiveEndSecond(x, end), x.DutyStatus, x.SpecialStatus, x.Note, x.Origin, x.Edited,
+				x.Revision, x.LocationText, x.OdometerMiles, x.EngineHours, x.TrailerNumber, x.ShippingDocument, x.EditReason)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type hosInterval struct {
+	start  time.Time
+	end    time.Time
+	status string
+}
+
+func (s *Server) recalcHOSFromSegments(ctx context.Context, driverID string) error {
+	var timezone string
+	if err := s.db.QueryRow(ctx, `SELECT home_terminal_timezone FROM drivers WHERE id=$1`, driverID).Scan(&timezone); err != nil {
+		return err
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	startDate := today.AddDate(0, 0, -7)
+	rows, err := s.db.Query(ctx, `
+SELECT log_date,start_minute,end_minute,duty_status
+FROM duty_segments WHERE driver_id=$1 AND log_date BETWEEN $2::date AND $3::date
+ORDER BY log_date,start_minute,id`, driverID, startDate.Format("2006-01-02"), today.Format("2006-01-02"))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	intervals := []hosInterval{}
+	for rows.Next() {
+		var day time.Time
+		var start int
+		var end *int
+		var status string
+		if err := rows.Scan(&day, &start, &end, &status); err != nil {
+			return err
+		}
+		base := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, loc)
+		limit := 1440
+		if base.Equal(today) {
+			limit = now.Hour()*60 + now.Minute()
+			if limit < 1 {
+				limit = 1
+			}
+		}
+		e := limit
+		if end != nil {
+			e = *end
+		}
+		if e > limit {
+			e = limit
+		}
+		if e <= start {
+			continue
+		}
+		intervals = append(intervals, hosInterval{start: base.Add(time.Duration(start) * time.Minute), end: base.Add(time.Duration(e) * time.Minute), status: status})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	var restStart *time.Time
+	var previousEnd *time.Time
+	var last10, last34 *time.Time
+	for _, iv := range intervals {
+		rest := iv.status == "OFF" || iv.status == "SB"
+		if rest {
+			if restStart == nil || previousEnd == nil || !iv.start.Equal(*previousEnd) {
+				t := iv.start
+				restStart = &t
+			}
+			e := iv.end
+			previousEnd = &e
+			dur := iv.end.Sub(*restStart)
+			if dur >= 10*time.Hour {
+				t := iv.end
+				last10 = &t
+			}
+			if dur >= 34*time.Hour {
+				t := iv.end
+				last34 = &t
+			}
+		} else {
+			restStart = nil
+			e := iv.end
+			previousEnd = &e
+		}
+	}
+
+	windowStart := startDate
+	if last10 != nil && last10.After(windowStart) {
+		windowStart = *last10
+	}
+	cycleStart := startDate
+	if last34 != nil && last34.After(cycleStart) {
+		cycleStart = *last34
+	}
+	var shiftStart *time.Time
+	driveSinceReset := 0
+	driveSinceBreak := 0
+	cycleUsed := 0
+	for _, iv := range intervals {
+		cySt := iv.start
+		if cySt.Before(cycleStart) {
+			cySt = cycleStart
+		}
+		if iv.end.After(cycleStart) && (iv.status == "DR" || iv.status == "ON") {
+			cycleUsed += int(iv.end.Sub(cySt).Seconds())
+		}
+		if iv.end.Before(windowStart) || iv.end.Equal(windowStart) {
+			continue
+		}
+		st := iv.start
+		if st.Before(windowStart) {
+			st = windowStart
+		}
+		durSec := int(iv.end.Sub(st).Seconds())
+		if durSec < 0 {
+			durSec = 0
+		}
+		if (iv.status == "DR" || iv.status == "ON") && shiftStart == nil {
+			t := st
+			shiftStart = &t
+		}
+		if iv.status == "DR" {
+			driveSinceReset += durSec
+			driveSinceBreak += durSec
+		} else if iv.end.Sub(st) >= 30*time.Minute {
+			driveSinceBreak = 0
+		}
+	}
+	driveRemaining := 11*3600 - driveSinceReset
+	if driveRemaining < 0 {
+		driveRemaining = 0
+	}
+	breakRemaining := 8*3600 - driveSinceBreak
+	if breakRemaining < 0 {
+		breakRemaining = 0
+	}
+	shiftRemaining := 14 * 3600
+	if shiftStart != nil {
+		shiftRemaining -= int(now.Sub(*shiftStart).Seconds())
+		if shiftRemaining < 0 {
+			shiftRemaining = 0
+		}
+	}
+	cycleRemaining := 70*3600 - cycleUsed
+	if cycleRemaining < 0 {
+		cycleRemaining = 0
+	}
+	_, err = s.db.Exec(ctx, `
+INSERT INTO driver_hos_current(driver_id,break_remaining_seconds,drive_remaining_seconds,shift_remaining_seconds,cycle_remaining_seconds,
+ shift_started_at,last_10h_reset_at,last_34h_reset_at,calculated_at,revision)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),1)
+ON CONFLICT(driver_id) DO UPDATE SET break_remaining_seconds=EXCLUDED.break_remaining_seconds,
+ drive_remaining_seconds=EXCLUDED.drive_remaining_seconds, shift_remaining_seconds=EXCLUDED.shift_remaining_seconds,
+ cycle_remaining_seconds=EXCLUDED.cycle_remaining_seconds, shift_started_at=EXCLUDED.shift_started_at,
+ last_10h_reset_at=EXCLUDED.last_10h_reset_at, last_34h_reset_at=EXCLUDED.last_34h_reset_at,
+ calculated_at=now(), revision=driver_hos_current.revision+1`, driverID, breakRemaining, driveRemaining, shiftRemaining,
+		cycleRemaining, shiftStart, last10, last34)
+	return err
+}
+
+func (s *Server) handleAdminRangeEdit(w http.ResponseWriter, r *http.Request) {
+	driverID := strings.TrimSpace(r.PathValue("id"))
+	date := strings.TrimSpace(r.PathValue("date"))
+	if driverID == "" {
+		writeError(w, 400, "driver id is required")
+		return
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeError(w, 400, "date must be YYYY-MM-DD")
+		return
+	}
+	var in rangeEditInput
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	in.Status = strings.ToUpper(strings.TrimSpace(in.Status))
+	in.SpecialStatus = strings.ToUpper(strings.TrimSpace(in.SpecialStatus))
+	in.Reason = strings.TrimSpace(in.Reason)
+	in.Operator = operatorName(r.Context())
+	if in.Operator == "" {
+		in.Operator = "Admin"
+	}
+	if in.Reason == "" {
+		in.Reason = "Administrative log edit"
+	}
+	duty := ""
+	special := ""
+	switch in.Status {
+	case "PC":
+		duty, special = "OFF", "PC"
+	case "YM":
+		duty, special = "ON", "YM"
+	default:
+		var ok bool
+		duty, ok = normalizeStatus(in.Status)
+		if !ok {
+			writeError(w, 400, "invalid status")
+			return
+		}
+		if in.SpecialStatus == "PC" || in.SpecialStatus == "YM" {
+			special = in.SpecialStatus
+		}
+	}
+	_, dayEnd, current, err := s.driverDayLimit(r.Context(), driverID, date)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 404, "driver not found")
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
+	}
+	if in.StartMinute < 0 || in.EndMinute <= in.StartMinute || in.EndMinute > dayEnd {
+		writeError(w, 400, "invalid edit range for this log date")
+		return
+	}
+	if in.Note == "" {
+		if special != "" {
+			in.Note = special + " administrative edit"
+		} else {
+			in.Note = duty + " administrative edit"
+		}
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	beforeRaw, err := s.scanSegmentsTx(r.Context(), tx, driverID, date)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	before := canonicalSegments(beforeRaw, dayEnd)
+	after := applyRangeOverlay(before, in, duty, special)
+	if current && len(after) > 0 {
+		after[len(after)-1].EndMinute = intPointer(dayEnd)
+	}
+	beforeJSON, _ := json.Marshal(beforeRaw)
+	afterJSON, _ := json.Marshal(after)
+	if err := s.replaceDaySegmentsTx(r.Context(), tx, driverID, date, after, current); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+INSERT INTO log_edit_batches(driver_id,log_date,action,reason,operator_name,start_minute,end_minute,before_segments,after_segments)
+VALUES($1,$2,'range_edit',$3,$4,$5,$6,$7::jsonb,$8::jsonb)`, driverID, date, in.Reason, in.Operator, in.StartMinute, in.EndMinute, string(beforeJSON), string(afterJSON)); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if current && in.EndMinute >= dayEnd {
+		_, _ = tx.Exec(r.Context(), `UPDATE driver_live_state SET duty_status=$2,status_since=now(),revision=revision+1 WHERE driver_id=$1`, driverID, duty)
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.recalcHOSFromSegments(r.Context(), driverID)
+	writeJSON(w, 200, map[string]any{"ok": true, "driver_id": driverID, "date": date, "start_minute": in.StartMinute, "end_minute": in.EndMinute})
+}
+
+func (s *Server) handleAdminLogUndo(w http.ResponseWriter, r *http.Request) {
+	driverID := strings.TrimSpace(r.PathValue("id"))
+	date := strings.TrimSpace(r.PathValue("date"))
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeError(w, 400, "date must be YYYY-MM-DD")
+		return
+	}
+	var in struct {
+		Operator string `json:"operator"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in)
+	if strings.TrimSpace(in.Operator) == "" {
+		in.Operator = "Admin"
+	}
+	_, _, current, err := s.driverDayLimit(r.Context(), driverID, date)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 404, "driver not found")
+		} else {
+			writeError(w, 400, err.Error())
+		}
+		return
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err = lockDriver(r.Context(), tx, driverID); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	var operation *string
+	if err = tx.QueryRow(r.Context(), `SELECT operation_id::text FROM log_edit_batches WHERE driver_id=$1 AND log_date=$2 AND undone_at IS NULL ORDER BY created_at DESC LIMIT 1`, driverID, date).Scan(&operation); err == nil && operation != nil {
+		if err = s.undoSwapTx(r.Context(), tx, driverID, *operation, operatorName(r.Context())); err != nil {
+			writeError(w, 409, err.Error())
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		_ = s.recalcHOSFromSegments(r.Context(), driverID)
+		writeJSON(w, 200, map[string]any{"ok": true, "operation_id": operation})
+		return
+	}
+
+	var batchID string
+	var beforeJSON string
+	var startMinute, endMinute int
+	err = tx.QueryRow(r.Context(), `
+SELECT id::text,before_segments::text,start_minute,end_minute
+FROM log_edit_batches WHERE driver_id=$1 AND log_date=$2 AND undone_at IS NULL
+ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, driverID, date).Scan(&batchID, &beforeJSON, &startMinute, &endMinute)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 409, "there is no edit to undo for this day")
+		return
+	}
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	var before []SegmentResponse
+	if err := json.Unmarshal([]byte(beforeJSON), &before); err != nil {
+		writeError(w, 500, "stored edit snapshot is invalid")
+		return
+	}
+	if err := s.replaceDaySegmentsTx(r.Context(), tx, driverID, date, before, current && len(before) > 0 && before[len(before)-1].EndMinute == nil); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `UPDATE log_edit_batches SET undone_at=now(),undone_by=$2 WHERE id=$1::uuid`, batchID, in.Operator); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	_ = s.recalcHOSFromSegments(r.Context(), driverID)
+	writeJSON(w, 200, map[string]any{"ok": true, "undone_edit_id": batchID})
+}
+
+func (s *Server) handleAdminSegment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		Date          string `json:"date"`
+		StartMinute   int    `json:"start_minute"`
+		EndMinute     *int   `json:"end_minute"`
+		Status        string `json:"status"`
+		SpecialStatus string `json:"special_status"`
+		Note          string `json:"note"`
+		Origin        string `json:"origin"`
+		Edited        bool   `json:"edited"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if _, err := time.Parse("2006-01-02", in.Date); err != nil {
+		writeError(w, 400, "date must be YYYY-MM-DD")
+		return
+	}
+	status, ok := normalizeStatus(in.Status)
+	if !ok {
+		writeError(w, 400, "invalid status")
+		return
+	}
+	if in.StartMinute < 0 || in.StartMinute > 1440 || (in.EndMinute != nil && (*in.EndMinute < in.StartMinute || *in.EndMinute > 1440)) {
+		writeError(w, 400, "invalid minute range")
+		return
+	}
+	if in.Origin == "" {
+		in.Origin = "ELD"
+	}
+	var x SegmentResponse
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO duty_segments(driver_id,log_date,start_minute,end_minute,duty_status,special_status,note,origin,edited)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+RETURNING id::text,start_minute,end_minute,duty_status,special_status,note,origin,edited,revision,
+ location_text,odometer_miles,engine_hours,trailer_number,shipping_document,edit_reason`,
+		id, in.Date, in.StartMinute, in.EndMinute, status, in.SpecialStatus, in.Note, in.Origin, in.Edited).Scan(
+		&x.ID, &x.StartMinute, &x.EndMinute, &x.DutyStatus, &x.SpecialStatus, &x.Note, &x.Origin, &x.Edited, &x.Revision,
+		&x.LocationText, &x.OdometerMiles, &x.EngineHours, &x.TrailerNumber, &x.ShippingDocument, &x.EditReason)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, x)
+}
+
+func (s *Server) handleAdminEvent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		Date            string  `json:"date"`
+		Minute          int     `json:"minute"`
+		EventTime       *string `json:"event_time"`
+		EventType       string  `json:"event_type"`
+		DutyStatus      *string `json:"duty_status"`
+		Note            string  `json:"note"`
+		LocationText    string  `json:"location_text"`
+		OdometerMiles   float64 `json:"odometer_miles"`
+		EngineHours     float64 `json:"engine_hours"`
+		DurationSeconds *int    `json:"duration_seconds"`
+		Origin          string  `json:"origin"`
+		Diagnostic      bool    `json:"diagnostic"`
+		Violation       bool    `json:"violation"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if _, err := time.Parse("2006-01-02", in.Date); err != nil {
+		writeError(w, 400, "date must be YYYY-MM-DD")
+		return
+	}
+	if in.Minute < 0 || in.Minute > 1440 {
+		writeError(w, 400, "minute must be 0..1440")
+		return
+	}
+	if in.EventType == "" {
+		in.EventType = "duty_status"
+	}
+	if in.Origin == "" {
+		in.Origin = "ELD"
+	}
+	var duty *string
+	if in.DutyStatus != nil && strings.TrimSpace(*in.DutyStatus) != "" {
+		v, ok := normalizeStatus(*in.DutyStatus)
+		if !ok {
+			writeError(w, 400, "invalid duty_status")
+			return
+		}
+		duty = &v
+	}
+	var eventTime *time.Time
+	if in.EventTime != nil && strings.TrimSpace(*in.EventTime) != "" {
+		t, err := time.Parse(time.RFC3339, strings.TrimSpace(*in.EventTime))
+		if err != nil {
+			writeError(w, 400, "event_time must be RFC3339")
+			return
+		}
+		eventTime = &t
+	}
+	var x EventResponse
+	var et *time.Time
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO eld_events(driver_id,log_date,minute,event_time,event_type,duty_status,note,location_text,odometer_miles,engine_hours,duration_seconds,origin,diagnostic,violation)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+RETURNING id::text,minute,event_time,event_type,duty_status,note,location_text,odometer_miles,engine_hours,duration_seconds,origin,diagnostic,violation,edited,edit_reason,co_driver,revision`,
+		id, in.Date, in.Minute, eventTime, in.EventType, duty, in.Note, in.LocationText, in.OdometerMiles, in.EngineHours, in.DurationSeconds, in.Origin, in.Diagnostic, in.Violation).Scan(
+		&x.ID, &x.Minute, &et, &x.EventType, &x.DutyStatus, &x.Note, &x.LocationText, &x.OdometerMiles, &x.EngineHours, &x.DurationSeconds,
+		&x.Origin, &x.Diagnostic, &x.Violation, &x.Edited, &x.EditReason, &x.CoDriver, &x.Revision)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	x.EventTime = timeString(et)
+	writeJSON(w, 201, x)
+}
+
+func (s *Server) handleAdminAlert(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		DriverID string `json:"driver_id"`
+		Kind     string `json:"kind"`
+		Priority string `json:"priority"`
+		Title    string `json:"title"`
+		Detail   string `json:"detail"`
+		EventID  string `json:"event_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.Title) == "" {
+		writeError(w, 400, "title is required")
+		return
+	}
+	if in.Kind == "" {
+		in.Kind = "alert"
+	}
+	if in.Priority == "" {
+		in.Priority = "attention"
+	}
+	if in.DriverID != "" {
+		if i := identityFromContext(r.Context()); i != nil && !s.ensureDriverAllowed(r.Context(), i, in.DriverID) {
+			writeError(w, http.StatusForbidden, "driver is outside your company access")
+			return
+		}
+	}
+	var a AlertResponse
+	err := s.db.QueryRow(r.Context(), `
+INSERT INTO alerts(driver_id,kind,priority,title,detail,event_id)
+VALUES(NULLIF($1,''),$2,$3,$4,$5,$6)
+RETURNING id::text,COALESCE(driver_id,''),kind,priority,title,detail,event_id,status,owner,resolution`,
+		in.DriverID, in.Kind, in.Priority, in.Title, in.Detail, in.EventID).Scan(&a.ID, &a.DriverID, &a.Kind, &a.Priority, &a.Title, &a.Detail, &a.EventID, &a.Status, &a.Owner, &a.Resolution)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, a)
+}
+
+func (h *Hub) add(c *WSClient) { h.mu.Lock(); h.clients[c] = struct{}{}; h.mu.Unlock() }
+func (h *Hub) remove(c *WSClient) {
+	h.mu.Lock()
+	delete(h.clients, c)
+	h.mu.Unlock()
+	_ = c.conn.Close()
+}
+func (h *Hub) broadcast(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	clients := make([]*WSClient, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	companyID := ""
+	if m, ok := v.(map[string]any); ok {
+		if x, ok := m["company_id"].(string); ok {
+			companyID = x
+		}
+	}
+	for _, c := range clients {
+		if !c.authed {
+			continue
+		}
+		if companyID != "" && c.identity != nil && !c.identity.companyAllowed(companyID) {
+			continue
+		}
+		c.mu.Lock()
+		err := c.conn.WriteMessage(websocket.TextMessage, b)
+		c.mu.Unlock()
+		if err != nil {
+			h.remove(c)
+		}
+	}
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return s.originAllowed(r.Header.Get("Origin")) }}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	expectedToken := s.apiToken
+	if expectedToken == "" {
+		expectedToken = s.adminToken
+	}
+	c := &WSClient{conn: conn, authed: expectedToken == "" && s.adminToken == "" && s.apiToken == ""}
+	if c.authed {
+		c.identity = &WebIdentity{Username: "legacy-open", Role: "viewer", AllCompanies: true, Legacy: true, CompanyIDs: map[string]bool{}}
+	}
+	s.hub.add(c)
+	defer s.hub.remove(c)
+	for {
+		_, b, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]any
+		if json.Unmarshal(b, &msg) != nil {
+			continue
+		}
+		t, _ := msg["type"].(string)
+		switch t {
+		case "authenticate":
+			token, _ := msg["token"].(string)
+			var ident *WebIdentity
+			if x := s.legacyIdentity(token, false); x != nil {
+				ident = x
+			} else if x, err := s.loadWebIdentity(r.Context(), token); err == nil {
+				ident = x
+			}
+			if ident != nil {
+				c.authed = true
+				c.identity = ident
+				c.mu.Lock()
+				_ = c.conn.WriteJSON(map[string]any{"type": "authenticated", "role": ident.Role})
+				c.mu.Unlock()
+			} else {
+				c.mu.Lock()
+				_ = c.conn.WriteJSON(map[string]any{"type": "error", "error": "invalid access token"})
+				c.mu.Unlock()
+			}
+		case "ping":
+			c.mu.Lock()
+			_ = c.conn.WriteJSON(map[string]any{"type": "pong", "ts": time.Now().UnixMilli()})
+			c.mu.Unlock()
+		case "pong", "subscribe":
+			// Topic subscriptions are accepted. This single-workspace starter broadcasts all authorized changes.
+		}
+	}
+}
+
+func (s *Server) listenForChanges(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, err := pgx.Connect(ctx, s.databaseURL)
+		if err != nil {
+			log.Printf("LISTEN connect: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if _, err = conn.Exec(ctx, "LISTEN neksus_changes"); err != nil {
+			log.Printf("LISTEN start: %v", err)
+			_ = conn.Close(ctx)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		log.Printf("PostgreSQL realtime listener active")
+		for {
+			n, err := conn.WaitForNotification(ctx)
+			if err != nil {
+				log.Printf("LISTEN wait: %v", err)
+				_ = conn.Close(ctx)
+				time.Sleep(2 * time.Second)
+				break
+			}
+			var p notifyPayload
+			if json.Unmarshal([]byte(n.Payload), &p) != nil {
+				continue
+			}
+			s.handleDBNotification(ctx, p)
+		}
+	}
+}
+
+func (s *Server) handleDBNotification(ctx context.Context, p notifyPayload) {
+	companyID := ""
+	if p.DriverID != "" {
+		companyID, _ = s.driverCompanyID(ctx, p.DriverID)
+	}
+	switch p.Table {
+	case "drivers":
+		s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID, "company_id": companyID})
+	case "driver_live_state":
+		if x, err := s.queryLiveState(ctx, p.DriverID); err == nil {
+			s.hub.broadcast(map[string]any{"type": "fleet.driver.updated", "driver_id": p.DriverID, "company_id": companyID, "data": x})
+		} else {
+			s.hub.broadcast(map[string]any{"type": "driver.updated", "driver_id": p.DriverID, "company_id": companyID})
+		}
+	case "driver_hos_current":
+		if h, err := s.queryHOS(ctx, p.DriverID); err == nil {
+			s.hub.broadcast(map[string]any{"type": "driver.hos.updated", "driver_id": p.DriverID, "company_id": companyID, "data": h})
+		}
+	case "duty_segments", "eld_events":
+		s.hub.broadcast(map[string]any{"type": "driver.log.updated", "driver_id": p.DriverID, "company_id": companyID})
+	case "alerts":
+		s.hub.broadcast(map[string]any{"type": "alerts.updated"})
+	case "driver_alarms":
+		s.hub.broadcast(map[string]any{"type": "driver.alarm.updated", "driver_id": p.DriverID, "company_id": companyID, "alarm_id": p.ID})
+	case "companies":
+		s.hub.broadcast(map[string]any{"type": "companies.updated", "company_id": p.ID})
+	}
+}
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.LUTC | log.Lmicroseconds)
+}
