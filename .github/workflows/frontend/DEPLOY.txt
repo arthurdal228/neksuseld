@@ -1,3 +1,0 @@
-NEKSUS frontend v17
-
-Deploy index.html AND v17.js together. Vercel Root Directory: frontend; Framework: Other. Backend v17 must be deployed first.
